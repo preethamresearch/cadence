@@ -110,6 +110,23 @@ Answers for <https://forms.gle/xv1TXSiC54MEWujRA>. Fill the bracketed bits.
 
 ---
 
+---
+
+## AI assistant disclosure  *(required by the rules — omitting this is disqualification)*
+
+> This project was built with heavy use of an AI coding assistant (Claude, via
+> Claude Code). It was used throughout: designing the `realtime.*` semantic
+> conventions, implementing the duplex turn state machine, writing the tests,
+> building the console and landing page, provisioning SigNoz dashboards and
+> alerts, and diagnosing the eight silent failures documented in the README.
+>
+> Direction, judgement calls, and review were mine — including the schema
+> naming decision, the SLO thresholds, and the decision to run against the real
+> Gemini Live API rather than ship a simulator-only submission. All code was
+> written during the hackathon window.
+
+---
+
 ## Notes for judges (put in the README, not the form)
 
 **What's real vs. generated.** The recorder, semantic conventions, SDK, OTLP

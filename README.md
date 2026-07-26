@@ -348,6 +348,14 @@ scripts/simulate.py
 docs/SEMCONV.md    the specification
 ```
 
+## AI assistance
+
+Built with substantial help from an AI coding assistant (Claude, via Claude
+Code) — schema design, the turn state machine, tests, console, SigNoz
+provisioning, and debugging. Declared here and in the submission because the
+hackathon rules require it. Direction and review were human; all code was
+written during the hackathon window.
+
 ## License
 
 Apache-2.0
