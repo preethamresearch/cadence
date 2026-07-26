@@ -16,7 +16,9 @@ Answers for <https://forms.gle/xv1TXSiC54MEWujRA>. Fill the bracketed bits.
 
 **Deployed link:** https://preethamresearch.github.io/cadence/
 
-**YouTube demo:** https://youtu.be/CZ2TeXH-yFY
+**YouTube demo:** https://youtu.be/fIbf-5_2tRQ
+
+**Full walkthrough (4:30):** https://youtu.be/CZ2TeXH-yFY
 
 **Blog:** https://dev.to/preetham_25a78ec384dac787/signoz-scanned-36000-rows-and-told-me-no-data-1o39
 
