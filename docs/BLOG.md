@@ -1,284 +1,294 @@
-# Your voice agent's worst moment is invisible to your tracing
+# SigNoz scanned 36,000 rows and told me "No Data"
 
-*Building `cadence`: OpenTelemetry instrumentation for real-time, full-duplex
-voice agents — and shipping it to SigNoz.*
+I spent an hour convinced my instrumentation was broken. It wasn't. The
+telemetry was arriving, ClickHouse was reading it, and every dashboard panel
+still said **No Data** — over a table that had 36,291 rows in it.
+
+That was one of eight bugs I hit last week building OpenTelemetry
+instrumentation for real-time voice agents. Not one of them threw an
+exception. Not one showed up in a log. Six of them I found *after* the code
+was already "working."
+
+This post is the list, with the commands I used to find each one. If you are
+instrumenting anything that streams — voice, video, an agent loop — you will
+probably hit at least three of these.
 
 ---
 
-Here is a bug report you cannot act on:
+## What I was building, briefly
 
-> "The voice agent feels laggy."
+Voice agents like Gemini Live hold a **persistent bidirectional socket**.
+Audio goes both ways at once. There is no request and no response, so the
+OpenTelemetry GenAI conventions — which define `chat` spans around a
+request/response pair — have nothing to attach to.
 
-You open your traces. The span says the exchange took 3.2 seconds. Is that bad?
-You have no idea. The user spoke for two of those seconds. Was the agent slow to
-start talking, or did it just give a long answer? Those are completely different
-failures with completely different fixes, and your tracing cannot tell them
-apart.
+The number that actually matters for a voice agent is **time to first audio**:
+how long the human sat in silence after they stopped talking. That interval
+lives *between* spans, so no waterfall draws it.
 
-That is not a gap in your instrumentation. It is a gap in the model underneath
-it.
-
-## Everything assumes request → response
-
-The OpenTelemetry GenAI semantic conventions — still pre-1.0 as of mid-2026 —
-define spans named `chat`, `invoke_agent`, and `execute_tool`, with attributes
-like `gen_ai.request.model` and `gen_ai.usage.input_tokens`. Every LLM
-observability library in the ecosystem is built on the same premise: you send a
-prompt, a span opens; the completion returns, the span closes.
-
-For chat completions that is exactly right.
-
-Real-time voice agents do not work that way. Gemini Live and OpenAI Realtime
-hold a **persistent bidirectional WebSocket**. Audio flows in both directions
-simultaneously. There is no request. There is no response. There is no moment
-where either party is definitively finished — because the user can, and
-constantly does, talk straight over the model.
-
-Four things break at once.
-
-**There is no span boundary.** Nothing on the wire says "a request started."
-Audio just streams. Instrument it naively and you get one span per session,
-spanning twenty exchanges, telling you nothing.
-
-**Duration is the wrong metric.** What makes a voice agent feel alive is not how
-long the exchange took. It is how long the human sat in *silence* after they
-stopped talking, before they heard anything at all. A turn can have a perfectly
-respectable total duration and still feel broken, because all the delay landed
-at the front.
-
-**Barge-in has no representation.** The single most common failure mode of voice
-agents — the user interrupting — does not exist in any convention, because in a
-request/response world it *cannot* exist. Yet how often it happens, and how far
-into the agent's reply, is the strongest signal of conversational quality you
-can measure.
-
-**Cost accounting doesn't apply.** Input isn't a countable prompt. It's an open
-microphone billed per second, plus optional video frames. `input_tokens` is
-still emitted, but without a modality split it hides which stream is actually
-spending your money.
-
-So I built `cadence`.
-
-## Reconstructing a turn from a stream
-
-The core problem: **carve conversational structure out of a continuous duplex
-signal.** cadence consumes the stream and emits this:
+So I built `cadence`: a state machine that reconstructs turn structure from the
+raw signal stream and emits it as ordinary OTLP.
 
 ```
-realtime.session                    one connected session
-├── realtime.turn                        one exchange
-│   ├── realtime.audio.user_utterance          VAD speech-start → speech-end
-│   ├── chat                          speech-end → generation done   [gen_ai.*]
-│   │   └── execute_tool              tools, including mid-stream
-│   └── realtime.audio.agent_utterance         first audio out → playback done
-│       └── (event) realtime.barge_in    offset_ms into the reply
-└── realtime.turn …
+realtime.session                        one connected session
+├── realtime.turn                       one exchange
+│   ├── realtime.audio.user_utterance   VAD start → end
+│   ├── chat                            [standard gen_ai.* attributes]
+│   │   └── execute_tool
+│   └── realtime.audio.agent_utterance  first audio out → done
+│       └── (event) realtime.barge_in   offset_ms into the reply
 ```
 
-Note that `chat` and `execute_tool` keep their standard GenAI names and
-attributes. The `realtime.*` namespace **composes with** `gen_ai.*` rather than
-replacing it — model inference inside a turn is still just a model call, and
-existing backends should light up on it unchanged.
+![Real Gemini Live session as an OpenTelemetry trace in SigNoz](./blog_assets/01-trace-waterfall.jpg)
 
-Three decisions in that model turned out to be load-bearing, and I got each of
-them wrong first.
+That is a real Gemini session in SigNoz. Getting there took the eight bugs
+below.
 
-### 1. Measure latency at the audio boundary, not the model boundary
+---
 
-`realtime.turn.time_to_first_audio` runs from the **last inbound frame of user
-audio** to the **first outbound frame of agent audio**.
+## 1. The collector was running, and doing nothing
 
-That interval deliberately includes VAD dwell time, network transit, model
-queueing, and time-to-first-token. All of them are silence to the person
-waiting. If you measure from the model call instead, you get a number that looks
-great on a dashboard while users complain the thing is unresponsive — because
-you excluded the 400ms of voice-activity-detection hangover sitting in front of
-it.
+I installed SigNoz with Foundry, which brings up the backend *and* its MCP
+server in one step:
 
-My first implementation measured from turn start. That included the user's own
-speech, so a person who asked a long question looked like a slow agent. The
-fix is one line and the test that catches it is worth more than the line:
+```bash
+curl -fsSL https://signoz.io/foundry.sh | bash
+foundryctl cast -f deploy/casting.yaml
+```
+
+Containers healthy. Port 4318 open. And the exporter kept logging
+`RemoteDisconnected`. `curl` confirmed it — TCP connected, then the server hung
+up without an HTTP response:
+
+```
+* Connected to localhost (127.0.0.1) port 4318
+> POST /v1/traces HTTP/1.1
+* Empty reply from server
+```
+
+The effective collector config explains it:
+
+```bash
+docker exec signoz-ingester-1 sh -lc \
+  "awk '/^service:/{f=1} f' /var/tmp/collector-config.yaml"
+```
+
+```yaml
+service:
+  pipelines:
+    traces:
+      exporters: [nop]
+      receivers: [nop]
+```
+
+Every pipeline was `nop`. The config *file* on disk was correct — the running
+collector had never received it. The reason was in the SigNoz server log:
+
+```
+failed to find or create agent ... "cannot create agent without orgId"
+```
+
+**SigNoz will not hand a collector its configuration until an organisation
+exists.** I had not completed the first-run signup at `localhost:8080`. Until
+you do, the OTLP port accepts connections and answers nothing.
+
+Do the signup, restart the ingester, and the pipelines populate.
+
+---
+
+## 2. The exporter silently dropped 60% of my spans
+
+I generated 1,201 turns. ClickHouse had 497.
+
+```sql
+SELECT name, count() FROM signoz_traces.distributed_signoz_index_v3
+GROUP BY name ORDER BY count() DESC
+```
+
+No error surfaced. The OpenTelemetry `BatchSpanProcessor` defaults to a
+**2,048-span queue**, and a realtime workload overruns it instantly — each turn
+produces four to six spans, so a few hundred concurrent turns is enough. When
+the queue is full, spans are dropped, and the SDK does not raise.
 
 ```python
-def test_ttfa_measured_from_end_of_user_speech(harness):
-    rec.handle(ev(EventType.USER_SPEECH_START, 10.0))
-    rec.handle(ev(EventType.USER_SPEECH_END, 12.0))          # spoke for 2s
-    rec.handle(ev(EventType.AGENT_AUDIO_CHUNK, 12.42))       # replied 420ms later
-
-    # 420ms, not 2420ms.
-    assert turn.attributes[TURN_TTFA_MS] == approx(420.0)
+BatchSpanProcessor(
+    OTLPSpanExporter(endpoint=f"{endpoint}/v1/traces", headers=headers),
+    max_queue_size=32_768,        # default 2048 — far too small for streaming
+    max_export_batch_size=1_024,
+    schedule_delay_millis=2_000,
+)
 ```
 
-### 2. A barge-in ends the turn and starts a new one
+Re-ran it: 1,201 turns generated, 1,201 delivered.
 
-My first instinct was to record interruption as a flag on the ongoing turn. That
-is wrong. An interruption is not an error *inside* a turn — it is the user
-taking the floor, which is the definition of a new turn. Model it any other way
-and turn nesting becomes incoherent the moment a conversation gets lively.
+---
 
-The interruption itself is recorded as a **span event on the agent utterance it
-cut off**, carrying `realtime.turn.barge_in_offset_ms`. Putting it there rather than on
-a separate span means it lands at the exact point in the waterfall where the
-user cut in, which is what makes the trace readable at a glance.
+## 3, 4, 5. Three ways to get timestamps wrong
 
-The offset **distribution** is the real diagnostic, not the count:
+I replay recorded sessions to populate dashboards, and replayed spans came out
+**0.06 ms long** while their attributes claimed 400 ms. Spans were being stamped
+at wall-clock "now" rather than at the time the event carried, so a session
+replayed in one second produced microsecond spans.
 
-- Offsets clustering under ~400ms → your VAD is firing on background noise, not
-  speech. Users aren't interrupting; your agent thinks they are.
-- Consistently large offsets → your agent is rambling and people are cutting it
-  off out of impatience.
-
-Same event count, opposite root causes, opposite fixes. You cannot distinguish
-them without the distribution.
-
-There is also a subtle double-counting trap. Gemini reports an `interrupted`
-flag *after* its own VAD decides the user has taken the floor — but cadence may
-have already detected the barge-in locally from inbound audio arriving during
-playback. Count both and every barge-in dashboard in your org reads exactly
-double. There's a test for that too.
-
-### 3. A missing metric beats a wrong one
-
-Agents speak first sometimes — proactive greetings, tool-triggered utterances.
-Those turns have no preceding user speech, so there is nothing to measure TTFA
-*from*.
-
-The tempting move is to fall back to session start. Don't. That silently injects
-garbage into your p95, and a corrupted latency percentile is worse than no
-percentile, because you'll act on it. cadence omits the attribute entirely and
-asserts on that:
+The OpenTelemetry API accepts explicit timestamps; use them:
 
 ```python
-def test_agent_initiated_turn_has_no_ttfa(harness):
-    assert TURN_TTFA_MS not in turn.attributes
+span = tracer.start_span(name, start_time=event.wall_ns, ...)
+span.end(end_time=event.wall_ns)
 ```
 
-## Making the silence visible
+Then every span landed near **1970** — because I passed `time.monotonic()` as
+the wall clock. Monotonic is time since boot, not since epoch.
 
-The console renders a live scrolling ribbon: your voice in sky blue, the agent
-in violet, and between them **the silence drawn as literal empty space**, with
-the milliseconds ticking upward while you wait.
+And the session span came out with a duration of several hours, because I
+opened it eagerly at "now" and closed it in the replayed past. Negative
+duration, wrapped unsigned.
 
-That gap is the entire argument. In a conventional trace view it is invisible —
-it's the space *between* two spans, and no waterfall draws the space between
-spans. Here it's the largest thing on screen, because to the person talking to
-the agent it is the only part of the turn they actually experience.
+The one worth stealing: **compare two views of the same quantity.** The span
+duration and the `duration_ms` attribute should agree, so check:
 
-Watching the number climb while you sit in silence, then freeze and grade itself
-green or red, communicates more about voice latency in three seconds than a
-percentile chart does in a week.
+```sql
+SELECT attributes_string['realtime.prompt.version'] AS src,
+       round(avg(durationNano)/1e6) AS span_ms,
+       round(avg(attributes_number['realtime.turn.duration_ms'])) AS attr_ms
+FROM signoz_traces.distributed_signoz_index_v3
+WHERE name = 'realtime.turn' GROUP BY src
+```
 
-## SigNoz: writing telemetry, then reading it back
+```
+v16    4863    26135501
+v17    5344    26095317
+```
 
-cadence exports over OTLP to SigNoz, and the dashboard covers TTFA percentiles,
-barge-in rate and offset distribution, turns by end reason, and token spend by
-modality.
+A 4.8-second span with a `duration_ms` attribute of **26,135,501** — seven
+hours. Durations were computed from `time.monotonic()` while spans were stamped
+from the event clock. In a live session the two coincide and this is invisible.
 
-Two things needed care.
+---
 
-**Histogram buckets.** OpenTelemetry's defaults are tuned for HTTP request
-durations in seconds. Applied to voice latency, essentially every measurement
-lands in one bucket and your p95 is noise. cadence registers explicit views —
-50, 100, 150, 200, 300, 400, 500, 650, 800, 1000, 1250, 1500, 2000, 3000, 5000
-ms — chosen so the interesting region is actually resolved.
+## 6. Cumulative vs delta: the "No Data" over 36,000 rows
 
-**Cardinality.** `realtime.session.id` is deliberately *not* a metric attribute.
-Unique ids on metric dimensions are the classic way to melt a time-series
-backend. Session correlation belongs on spans, where it's free.
+This is the one from the title.
 
-Then the part that makes the demo: **the agent queries SigNoz for its own
-traces.**
+Metrics were arriving. `signoz_metrics.distributed_samples_v4` had them. Every
+percentile and rate query returned nothing, and the response was quietly
+explicit about how much work it had done:
 
-Ask it *"how fast have you been responding?"* and it runs a p95 query against
-the very histogram its own turns populated seconds earlier, then answers out
-loud — "about 340 milliseconds, fast enough to feel immediate." Ask *"how often
-do I cut you off?"* and it reads back its own barge-in distribution and
-interprets it.
+```json
+"meta": { "rowsScanned": 36291, "bytesScanned": 495851 },
+"data": { "results": [ { "queryName": "A", "aggregations": null } ] }
+```
 
-cadence writes the telemetry. SigNoz stores it. The agent reads it back and
-tells you about itself. The loop closes.
+Scanned 36,291 rows. Aggregated to `null`.
 
-One honest detail: metric export has ingestion lag, so for the first minute of a
-session SigNoz has nothing. The tools fall back to live in-process stats **and
-say which source they used** — "SigNoz hasn't picked this session up yet, but
-right now it's around 340 milliseconds." An agent that confidently reports a p95
-it does not have is worse than one that admits the data hasn't landed.
+**SigNoz expects delta temporality for counters and histograms. The
+OpenTelemetry Python SDK defaults to cumulative.** Nothing errors — the data is
+stored, and every rate and percentile computes to nothing.
 
+```python
+from opentelemetry.sdk.metrics import Counter, Histogram
+from opentelemetry.sdk.metrics.export import AggregationTemporality
 
-## It works against the real API — and the numbers surprised me
+OTLPMetricExporter(
+    endpoint=f"{endpoint}/v1/metrics",
+    headers=headers,
+    preferred_temporality={
+        Counter: AggregationTemporality.DELTA,
+        Histogram: AggregationTemporality.DELTA,
+    },
+)
+```
 
-Everything above was built against synthetic events and a traffic simulator,
-which is fine for designing a state machine but proves nothing about the
-adapter that actually touches Gemini. So the last thing I did was run real
-sessions through it.
+One dictionary. Every panel populated.
 
-All nine normalized events fired from real `LiveServerMessage`s — VAD
-boundaries, turn completion, tool calls, usage metadata, interruption. The
-adapter's field mappings, written from SDK introspection, held up.
+![Conversation SLO dashboard with target lines drawn](./blog_assets/02-slo-dashboard.jpg)
 
-Then the numbers:
+Worth checking with the MCP server, which auto-fetches the metric's metadata
+and tells you what it thinks it is holding:
 
-| source | turns | mean TTFA | p95 |
+```
+metricType: histogram (auto-fetched)
+temporality: delta (auto-fetched)
+```
+
+---
+
+## 7 and 8. The two bugs only the real API found
+
+Everything above was found against a simulator. So I pointed it at the actual
+Gemini Live API — and my adapter, the one component that touches the vendor,
+had never processed a real message.
+
+It found two more.
+
+**Barge-in counted against finished turns.** Real sessions reported 22 barge-in
+events and **0% interrupted turns**. Those numbers must agree. The flag marking
+"the agent is speaking" was only cleared by a playback event my application
+never emitted, so every turn after the first looked like an interruption — and
+the barge-in was attributed to a span that had been exported seconds earlier.
+
+The subtlety in the fix: clear that flag when a turn *completes*, but **not**
+when it is interrupted. On an interruption the turn ends the instant the user
+cuts in while the agent's audio keeps playing — and that lingering audio is
+exactly the overlap being measured.
+
+**And the latency was nothing like I assumed.**
+
+| Source | Turns | Mean TTFA | p95 |
 |---|---|---|---|
-| simulated baseline | 1,887 | 248 ms | 442 ms |
-| simulated regression | 2,128 | 331 ms | 719 ms |
-| **real Gemini Live** | **17** | **1,120 ms** | **1,567 ms** |
+| simulated `v16` | 416 | 246 ms | 436 ms |
+| simulated `v17` | 428 | 328 ms | 716 ms |
+| **real Gemini Live** | **77** | **1,107 ms** | **1,658 ms** |
 
-Real Gemini Live is three to four times slower than the baseline I had been
-designing against. My 350ms objective — which I picked from turn-taking
-research, and still believe is the right target for a *spoken* turn — is not
-close to achievable on text-driven turns through this model today.
+![TTFA split by prompt version, with the real series well above both](./blog_assets/03-diagnostics-v16-v17.jpg)
 
-That is exactly the kind of thing you only learn by measuring, and it is a
-better argument for the project than any dashboard: I built the instrument,
-pointed it at reality, and reality disagreed with my assumptions.
+Real Gemini Live is three to four times slower than the baseline I had spent a
+day designing against. My 350 ms objective comes from turn-taking research and
+I still think it is right for a *spoken* turn — but it is nowhere near
+achievable on text-driven turns through this model today.
 
-One more finding, from the same run. Barge-in fired twelve times across
-fifteen turns — far more than a scripted run should produce. The cause is real:
-sending the next prompt promptly after `turn_complete` arrives makes Gemini
-report an interruption, because audio from the previous turn is still
-streaming. Good evidence that barge-in detection works. Also a reminder that a
-metric can be correct and still need context before you act on it.
-
-## What I'd do differently
-
-The `realtime.*` conventions are a **proposal**, not a standard, and there are
-genuinely open questions. Should `realtime.turn` be its own span name, or
-`invoke_agent` with a `realtime.*` attribute set? The latter reuses more existing
-tooling; I chose the former for clarity, and I'm not certain that was right.
-Multi-party audio is entirely out of scope. And I'm unsure whether TTFA is the
-right primary metric or whether the standard should also define
-time-to-first-*word* from output transcription — the two diverge when a model
-emits filler audio before content.
-
-Only the Gemini Live adapter exists today. But the turn state machine is
-provider-neutral: a provider ships a ~200-line translator into a small event
-vocabulary and inherits the whole span model. OpenAI Realtime is an adapter, not
-a second implementation.
-
-## Try it
-
-The library is two lines around an existing session:
-
-```python
-import cadence
-cadence.configure(service_name="my-voice-agent")
-
-async with client.aio.live.connect(model=MODEL, config=config) as raw:
-    async with cadence.CadenceSession(raw, model=MODEL) as session:
-        async for message in session.receive():
-            ...   # every message passes through untouched
-```
-
-`CadenceSession` wraps rather than monkey-patches — the Live API surface is
-still moving, and patching a library mid-flight is how instrumentation gets
-silently broken by a minor release. And instrumentation never raises into the
-audio path: a bug in cadence must not take down the agent it's watching. There's
-a test for exactly that.
-
-Repo, semantic convention spec, and importable SigNoz dashboard: **[link]**
+I left that in the README as found rather than quietly retuning the simulator
+to match. Instruments that agree with your assumptions are not instruments.
 
 ---
 
-*Built for the [Agents of SigNoz](https://www.wemakedevs.org/hackathons/signoz)
-hackathon.*
+## The thing I actually took away
+
+Every one of these eight failures was **silent**. The application reported
+success throughout. That is the property you want in production — your voice
+agent must not die because telemetry is unhappy — and it is precisely what
+makes this miserable to debug.
+
+So I wrote a preflight check that walks the chain and names the broken link:
+
+```
+library     ✓ cadence imports            v0.1.0, schema 0.1.0
+            ✓ turn state machine         TTFA 400ms (expected 400ms)
+signoz      ✓ SigNoz set up              v0.134.0
+            ✓ collector pipelines        real receivers and exporters
+transport   ✓ OTLP port reachable
+            ✓ OTLP endpoint answers      HTTP 200
+round trip  ✓ span exported end-to-end
+```
+
+Two details in there matter more than the rest. It checks **TCP reachability
+separately from "does it speak HTTP"**, because a `nop` pipeline accepts the
+connection and closes it — that distinction is bug #1 and it cost me an hour.
+And it drives a synthetic turn through the real state machine and asserts TTFA
+is **400 ms, not 2,400 ms**, because silently wrong telemetry is worse than an
+outage: nothing breaks, you just make decisions on bad numbers.
+
+If you take one thing from this: **compare two views of the same quantity.**
+Span duration against the duration attribute. Barge-in events against
+interrupted turns. That single habit found three of my eight bugs, and none of
+them would have surfaced any other way.
+
+---
+
+*Code, the `realtime.*` semantic conventions, and importable SigNoz dashboards:
+[github.com/preethamresearch/cadence](https://github.com/preethamresearch/cadence)
+· [3-minute demo](https://youtu.be/CZ2TeXH-yFY)*
+
+*Built for the Agents of SigNoz hackathon. Written by me; I used an AI
+assistant for the code and for editing this post, which is declared in the
+submission.*
