@@ -103,7 +103,14 @@ def pick(rng: random.Random, profiles: list[Profile]) -> Profile:
     return rng.choices(profiles, weights=[p.weight for p in profiles], k=1)[0]
 
 
-def simulate_session(rng: random.Random, profile: Profile, index: int) -> dict:
+def simulate_session(
+    rng: random.Random,
+    profile: Profile,
+    index: int,
+    *,
+    start_wall_ns: int,
+    spread_seconds: float,
+) -> dict:
     """Run one conversation through the real recorder.
 
     Uses a synthetic monotonic clock so a hundred sessions of conversation
@@ -118,18 +125,35 @@ def simulate_session(rng: random.Random, profile: Profile, index: int) -> dict:
         prompt_version=profile.prompt_version,
         agent_version="cadence-demo-1.0",
     )
-    rec.start()
+    # Deliberately not calling rec.start() here: handle() opens the session
+    # span lazily on the first event, which means it is stamped with that
+    # event's timestamp. Starting eagerly would open the session span at
+    # "now" and close it in the simulated past, producing a negative
+    # duration that wraps to nonsense.
 
-    clock = time.monotonic() + rng.uniform(0, 0.001)
-
-    def at(dt: float) -> float:
-        nonlocal clock
-        clock += dt
-        return clock
+    # Two clocks, deliberately.
+    #
+    # `monotonic` drives duration arithmetic and only differences matter, so a
+    # synthetic origin is fine. `wall_ns` becomes the span timestamp and must
+    # be real epoch nanoseconds — passing monotonic here puts every span near
+    # 1970 and yields durations in the billions of milliseconds.
+    #
+    # Sessions are also spread backwards across the window so the dashboards
+    # show a time series with shape rather than one vertical spike.
+    mono = 0.0
+    wall_start_ns = start_wall_ns - int(spread_seconds * 1e9)
 
     def emit(kind: EventType, dt: float, **kw) -> None:
-        t = at(dt)
-        rec.handle(VoiceEvent(type=kind, monotonic=t, wall_ns=int(t * 1e9), **kw))
+        nonlocal mono
+        mono += dt
+        rec.handle(
+            VoiceEvent(
+                type=kind,
+                monotonic=mono,
+                wall_ns=wall_start_ns + int(mono * 1e9),
+                **kw,
+            )
+        )
 
     turns = rng.randint(3, 8)
     handed_off = False
@@ -211,6 +235,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sessions", type=int, default=120)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument(
+        "--window-minutes", type=float, default=25.0,
+        help="Spread sessions back over this many minutes so dashboards "
+             "show a trend rather than a single spike.",
+    )
     parser.add_argument("--service", default=os.getenv("OTEL_SERVICE_NAME", "cadence-voice-agent"))
     parser.add_argument(
         "--endpoint",
@@ -229,12 +258,18 @@ def main() -> int:
     )
 
     rng = random.Random(args.seed)
+    now_ns = time.time_ns()
+    window_seconds = args.window_minutes * 60.0
     totals = {"turns": 0, "barge_ins": 0, "repairs": 0, "fallbacks": 0, "handoffs": 0}
 
     print(f"simulating {args.sessions} sessions -> {args.endpoint}")
     for i in range(args.sessions):
         profile = pick(rng, PROFILES)
-        stats = simulate_session(rng, profile, i)
+        # Oldest session furthest back, so the series reads left to right.
+        spread = window_seconds * (1.0 - i / max(1, args.sessions - 1))
+        stats = simulate_session(
+            rng, profile, i, start_wall_ns=now_ns, spread_seconds=spread
+        )
         totals["turns"] += stats["turns"]
         totals["barge_ins"] += stats["barge_ins"]
         totals["repairs"] += stats["repairs"]

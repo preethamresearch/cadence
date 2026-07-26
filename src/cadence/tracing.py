@@ -128,9 +128,16 @@ def configure(
                         endpoint=f"{endpoint.rstrip('/')}/v1/traces",
                         headers=headers,
                     ),
-                    # A voice session emits bursts of short spans; flushing
-                    # promptly keeps the live demo in step with the dashboard.
+                    # A realtime session emits bursts of short spans; flushing
+                    # promptly keeps a live demo in step with the dashboard.
                     schedule_delay_millis=2_000,
+                    # The SDK default queue is 2048 spans, which a realtime
+                    # workload overruns silently — each turn produces four to
+                    # six spans, so a few hundred concurrent turns drop data
+                    # with no error surfaced to the application. Measured: at
+                    # the default, 1201 simulated turns delivered only 497.
+                    max_queue_size=32_768,
+                    max_export_batch_size=1_024,
                 )
             )
         trace.set_tracer_provider(tracer_provider)

@@ -160,6 +160,14 @@ class ConversationRecorder:
         self._session_span: Span | None = None
         self._session_ctx = None
         self._session_start: float | None = None
+
+        # Spans are stamped with the timestamp carried on the event rather
+        # than "now". For a live session the two are identical. For a replayed
+        # or reconstructed session they are not, and using wall-clock would
+        # collapse every span to microseconds — producing a trace whose
+        # attributes say 400ms while its waterfall says 0.06ms. The event
+        # timestamp is the honest one either way.
+        self._clock_ns: int | None = None
         self._turn: TurnState | None = None
         self._turn_index = 0
 
@@ -204,7 +212,7 @@ class ConversationRecorder:
         if self.agent_version:
             attributes[semconv.AGENT_VERSION] = self.agent_version
 
-        self._session_span = self._tracer.start_span(
+        self._session_span = self._start_span(
             semconv.SPAN_SESSION, kind=SpanKind.SERVER, attributes=attributes
         )
         self._session_ctx = trace.set_span_in_context(self._session_span)
@@ -259,7 +267,7 @@ class ConversationRecorder:
             if error is not None:
                 span.record_exception(error)
                 span.set_status(Status(StatusCode.ERROR, str(error)))
-            span.end()
+            span.end(end_time=self._clock_ns)
 
         self._metrics.outcome_count.add(1, {**self._attrs, semconv.SESSION_OUTCOME: outcome})
         self._metrics.silence_seconds.add(self._silence_ms / 1000.0, self._attrs)
@@ -283,6 +291,9 @@ class ConversationRecorder:
 
     def handle(self, event: VoiceEvent) -> None:
         """Feed one normalized event through the state machine."""
+        # Advance the span clock before dispatch, so any span opened or closed
+        # by this event is stamped at the moment the event actually occurred.
+        self._clock_ns = event.wall_ns
         if self._session_span is None:
             self.start()
         try:
@@ -313,7 +324,7 @@ class ConversationRecorder:
         turn = self._turn
         assert turn is not None
         if turn.user_utterance_span is None:
-            turn.user_utterance_span = self._tracer.start_span(
+            turn.user_utterance_span = self._start_span(
                 semconv.SPAN_USER_UTTERANCE,
                 context=trace.set_span_in_context(turn.span),
                 attributes={
@@ -345,7 +356,7 @@ class ConversationRecorder:
                 span.set_attribute(
                     semconv.AUDIO_UTTERANCE_TRANSCRIPT, " ".join(turn.user_transcript)
                 )
-            span.end()
+            span.end(end_time=self._clock_ns)
             turn.user_utterance_span = None
 
         # The only part of a realtime turn that maps cleanly onto the existing
@@ -358,7 +369,7 @@ class ConversationRecorder:
         }
         if self.model:
             attributes[semconv.GEN_AI_REQUEST_MODEL] = self.model
-        turn.inference_span = self._tracer.start_span(
+        turn.inference_span = self._start_span(
             semconv.SPAN_CHAT,
             kind=SpanKind.CLIENT,
             context=trace.set_span_in_context(turn.span),
@@ -412,7 +423,7 @@ class ConversationRecorder:
 
         if turn.agent_audio_start_monotonic is None:
             turn.agent_audio_start_monotonic = event.monotonic
-            turn.agent_utterance_span = self._tracer.start_span(
+            turn.agent_utterance_span = self._start_span(
                 semconv.SPAN_AGENT_UTTERANCE,
                 context=trace.set_span_in_context(turn.span),
                 attributes={
@@ -465,7 +476,7 @@ class ConversationRecorder:
             turn.inference_span.set_attribute(
                 semconv.GEN_AI_RESPONSE_FINISH_REASONS, ["stop"]
             )
-            turn.inference_span.end()
+            turn.inference_span.end(end_time=self._clock_ns)
             turn.inference_span = None
 
     # -- turn control --------------------------------------------------
@@ -513,7 +524,7 @@ class ConversationRecorder:
             self._metrics.tool_retries.add(1, {**self._attrs, semconv.TOOL_NAME: name})
 
         parent = turn.inference_span or turn.span
-        span = self._tracer.start_span(
+        span = self._start_span(
             semconv.SPAN_EXECUTE_TOOL,
             kind=SpanKind.INTERNAL,
             context=trace.set_span_in_context(parent),
@@ -550,7 +561,7 @@ class ConversationRecorder:
         if error:
             record.span.set_attribute(semconv.TOOL_ERROR, str(error))
             record.span.set_status(Status(StatusCode.ERROR, str(error)))
-        record.span.end()
+        record.span.end(end_time=self._clock_ns)
 
         self._metrics.tool_duration.record(
             duration_ms, {**self._attrs, semconv.TOOL_NAME: record.name}
@@ -624,7 +635,7 @@ class ConversationRecorder:
         if self.prompt_version:
             attributes[semconv.PROMPT_VERSION] = self.prompt_version
 
-        span = self._tracer.start_span(
+        span = self._start_span(
             semconv.SPAN_TURN,
             kind=SpanKind.SERVER,
             context=self._session_ctx,
@@ -655,16 +666,16 @@ class ConversationRecorder:
             record.span.set_status(
                 Status(StatusCode.ERROR, "tool did not return before turn end")
             )
-            record.span.end()
+            record.span.end(end_time=self._clock_ns)
         turn.tools.clear()
 
         if turn.user_utterance_span is not None:
-            turn.user_utterance_span.end()
+            turn.user_utterance_span.end(end_time=self._clock_ns)
             turn.user_utterance_span = None
 
         cancelled = turn.inference_span is not None and not turn.generation_complete
         if turn.inference_span is not None:
-            turn.inference_span.end()
+            turn.inference_span.end(end_time=self._clock_ns)
             turn.inference_span = None
 
         if turn.agent_utterance_span is not None:
@@ -683,7 +694,7 @@ class ConversationRecorder:
                 span.set_attribute(
                     semconv.AUDIO_UTTERANCE_TRANSCRIPT, " ".join(turn.agent_transcript)
                 )
-            span.end()
+            span.end(end_time=self._clock_ns)
             turn.agent_utterance_span = None
 
         span = turn.span
@@ -703,7 +714,7 @@ class ConversationRecorder:
             span.set_attribute(
                 semconv.TURN_MAX_STREAM_GAP_MS, round(turn.max_stream_gap_ms, 2)
             )
-        span.end()
+        span.end(end_time=self._clock_ns)
 
         metric_attrs = {**self._attrs, semconv.TURN_END_REASON: reason}
         self._metrics.turn_duration.record(duration_ms, metric_attrs)
@@ -823,6 +834,19 @@ class ConversationRecorder:
             return
         self._silence_ms += max(0.0, (now - self._quiet_since) * 1000.0)
         self._quiet_since = None
+
+    # ------------------------------------------------------------------
+    # Span clock
+    # ------------------------------------------------------------------
+
+    def _start_span(self, name: str, **kwargs: Any) -> Span:
+        """Open a span stamped at the current event time.
+
+        Every span cadence creates goes through here so that a replayed
+        session produces a waterfall with the same shape as the live one it
+        was reconstructed from.
+        """
+        return self._tracer.start_span(name, start_time=self._clock_ns, **kwargs)
 
     def _emit(self, kind: str, data: dict[str, Any]) -> None:
         if self.on_event is None:
