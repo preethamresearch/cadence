@@ -2,10 +2,11 @@
 
 # cadence
 
-**OpenTelemetry instrumentation for real-time, full-duplex voice agents.**
+**Telemetry for real-time multimodal agents.**
 
-Turn boundaries, time-to-first-audio, and barge-in — traced from a streaming
-audio socket and shipped to [SigNoz](https://signoz.io).
+OpenTelemetry semantic conventions, an instrumentation SDK, and a Conversation
+SLO for agents that talk, see, and act over a live stream — shipped to
+[SigNoz](https://signoz.io).
 
 *Built for the [Agents of SigNoz](https://www.wemakedevs.org/hackathons/signoz)
 hackathon · Track 1: AI & Agent Observability*
@@ -14,202 +15,251 @@ hackathon · Track 1: AI & Agent Observability*
 
 ---
 
-## The problem
+## The gap
 
 Every LLM observability tool assumes **request → response**. You send a prompt,
 a span opens; the completion returns, the span closes. The OpenTelemetry GenAI
-semantic conventions are built on that shape, and for chat completions it works
-fine.
+semantic conventions are built on that shape, and for chat completions they
+work.
 
-Real-time voice agents do not work that way.
+Real-time agents do not work that way. Voice agents, screen-sharing agents, and
+computer-use agents hold a **persistent bidirectional stream** where signal
+flows both directions at once. There is no request, no response, and no moment
+where either side is finished — the human can and does interrupt mid-action.
 
-Gemini Live and OpenAI Realtime speak over a **persistent bidirectional
-WebSocket**. Audio flows both directions simultaneously. There is no request,
-no response, and no moment at which either side is definitively finished —
-the user can and does talk over the model mid-sentence.
+Four things break:
 
-So when a voice agent feels broken in production, the existing tooling cannot
-tell you why:
+1. **There is no span boundary.** Nothing marks a request. Instrument it
+   naively and you get one span per session covering twenty exchanges.
+2. **Duration is the wrong latency metric.** What matters is how long the human
+   sat in *silence* before anything came back — not how long the exchange took.
+3. **Interruption has no representation.** The most common failure mode of
+   realtime agents cannot occur in a request/response world, so no convention
+   describes it.
+4. **Cost accounting breaks.** Input is an open microphone billed per second,
+   not a countable prompt.
 
-- **There is no span boundary.** Instrument it naively and you get one span per
-  session covering twenty exchanges.
-- **Duration is the wrong metric.** What matters is how long the human sat in
-  *silence* before hearing anything — not how long the exchange took in total.
-- **Barge-in is invisible.** The most common failure mode of voice agents has
-  no representation in any convention, because in a request/response world it
-  cannot happen.
-- **Cost accounting breaks.** Input is an open microphone billed per second,
-  not a countable prompt.
-
-cadence fills that gap: a `voice.*` semantic convention that composes with
-`gen_ai.*`, a state machine that reconstructs conversational structure from
-the raw signal stream, and a SigNoz dashboard of the SLIs that result.
-
-📄 **[Read the full semantic convention spec →](docs/SEMCONV.md)**
+📄 **[Read the semantic convention spec →](docs/SEMCONV.md)**
 
 ---
 
-## What it produces
+## What it gives you
+
+### 1. A versioned schema — `realtime.*`
+
+A single root with domain sub-namespaces, mirroring how `gen_ai.*` covers all
+of LLM work in OpenTelemetry. One root because a convention is only useful if
+people can remember and cite it, and `realtime.*` extends to modalities that
+don't exist yet without forcing a rename.
+
+| Namespace | Covers |
+|---|---|
+| `realtime.session.*` | the connected session, transport, prompt version |
+| `realtime.turn.*` | turn structure, interruption, repair, outcome |
+| `realtime.audio.*` | TTFA, stream gaps, voice identity, seconds streamed |
+| `realtime.vision.*` | camera and screen frames |
+| `realtime.tool.*` | tool execution, including mid-stream and interrupted |
+| `realtime.browser.*` | computer-use actions *(specified, no adapter yet)* |
+
+The schema is treated as a **public API**: `SCHEMA_VERSION` is semver, names
+are never renamed within a major version, and the version is stamped on every
+exported resource.
+
+### 2. Signals that don't exist elsewhere
 
 ```
-voice.conversation                    one connected session
-├── voice.turn                        one exchange
-│   ├── voice.user_utterance          VAD speech-start → speech-end
-│   ├── chat                          speech-end → generation done   [gen_ai.*]
-│   │   └── execute_tool              tools, including mid-stream
-│   └── voice.agent_utterance         first audio out → playback done
-│       └── (event) voice.barge_in    offset_ms into the reply
-└── voice.turn …
+realtime.session                          one connected session
+├── realtime.turn                         one exchange
+│   ├── realtime.audio.user_utterance     input start → input end
+│   ├── chat                              input end → generation done  [gen_ai.*]
+│   │   └── execute_tool                  tools, including mid-stream
+│   └── realtime.audio.agent_utterance    first output → playback done
+│       └── (event) realtime.barge_in     offset_ms into the reply
+└── realtime.turn …
 ```
 
-Plus metrics purpose-built for voice: a **time-to-first-audio** histogram with
-buckets that actually resolve (50ms–5s, not OpenTelemetry's HTTP-shaped
-defaults), barge-in **offset distribution**, and token spend split by
-**modality** — because in a realtime session, audio is the bill.
+- **Time to first audio** — the silence the user actually sat through
+- **Barge-in offset distribution** — *where* interruptions land, not just how many
+- **Speech overlap** — how long both parties talked at once before the agent yielded
+- **Repair rate** — how often the user had to repeat, correct, or ask again
+- **Containment / transfer** — did the agent finish the job, or did a human
+- **Stream gaps** — stutter *during* speech, distinct from a slow start
+- **Prompt version** on every span and metric — so a regression is attributable
+  to the deploy that caused it
 
----
+### 3. The Conversation SLO
 
-## The demo: an agent that reads its own telemetry
+Metrics say what happened. An SLO says whether it was acceptable.
 
-The demo app is a voice agent wired into a loop:
+| Objective | Target | Why this number |
+|---|---|---|
+| TTFA p95 | < 350 ms | Human turn-taking runs ~200ms; past 350ms reads as hesitation |
+| Interruptions / session | < 0.8 | Above this users are fighting for the floor |
+| Mean overlap | < 150 ms | Above this the agent is talking over people |
+| Containment | > 72% | The number the deployment is funded on |
+| Repair turns | < 9% | The closest proxy for "did it actually work" |
+| Human transfer | < 11% | The commercial ceiling on escalation |
 
-> **cadence** writes its turns into SigNoz → the agent **queries SigNoz** for
-> its own traces → it tells you how it has been performing, out loud.
+Each carries an **error budget** rather than a hard threshold: one slow turn is
+not an incident, and treating it as one teaches people to ignore alerts.
+Targets are defaults — `ConversationSLO.custom()` exists because a drive-through
+and a medical triage line have different tolerances.
 
-Ask it *"how fast have you been responding?"* and it runs a p95 query against
-the very histogram its own turns populated seconds earlier. Ask *"how often do
-I cut you off?"* and it reads back its own barge-in distribution — then
-interprets it ("interruptions landing under 400ms usually means VAD is firing
-on background noise").
+### 4. Regression attribution
 
-Because metric export has ingestion lag, the tools fall back to live
-in-process stats for the first minute of a session **and say which source they
-used**. An agent that confidently reports a p95 it does not have is worse than
-one that admits the data has not landed yet.
+An alert saying *"TTFA crossed 350ms"* tells you what the chart already showed.
+`cadence.analysis` says which dimension explains it:
 
-### The console
+> `realtime.turn.time_to_first_audio regressed +97% (300 → 592). TTFA +97% for
+> realtime.prompt.version=v17, while realtime.prompt.version=v16 stayed flat.`
 
-A live scrolling ribbon of who holds the floor. Your voice in sky blue, the
-agent in violet, and between them **the silence drawn as literal empty space**
-with the milliseconds ticking up while you wait.
-
-That gap is the whole argument. In a conventional trace view it is invisible —
-it is the space *between* two spans. Here it is the largest thing on screen,
-because to the person talking to the agent it is the only part of the turn
-they actually experience.
-
-Interrupt the agent mid-sentence and a marker lands at the exact offset, on
-screen and in the span.
-
-> **No API key?** Visit `/?replay=1` for a scripted session using numbers from
-> a real traced run.
+It stays quiet when nothing explains the change — if every segment moved
+together, it says *"look upstream"* rather than inventing a culprit. A
+confident wrong attribution is worse than none, because people act on it.
 
 ---
 
 ## Quick start
 
+### SigNoz, via Foundry
+
+Foundry brings up SigNoz **and its MCP server** in one step:
+
 ```bash
-git clone <this repo> && cd cadence
+curl -fsSL https://signoz.io/foundry.sh | bash
+foundryctl cast -f deploy/casting.yaml
+```
+
+Then open <http://localhost:8080> and **complete the first-run signup**. This is
+required: until an organisation exists, the config server refuses to register
+the collector and every pipeline stays `nop` — the OTLP port accepts TCP but
+never answers. (That failure mode cost me an hour; it is in the docs so it
+doesn't cost you one.)
+
+Ports: `8080` UI · `4317/4318` OTLP ingest · `8000` MCP server.
+
+### cadence
+
+```bash
 python3 -m venv .venv && .venv/bin/pip install -e ".[app,dev]"
 cp .env.example .env      # then fill it in
+.venv/bin/python scripts/simulate.py --sessions 140   # populate the dashboards
 .venv/bin/uvicorn app.main:app --reload --port 8080
 ```
 
-Open <http://localhost:8080>, press **start**, and talk.
-
-### Configuration
-
-| Variable | Purpose |
-|---|---|
-| `GEMINI_API_KEY` | [AI Studio key](https://aistudio.google.com/apikey) for Gemini Live. |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | `https://ingest.<region>.signoz.cloud:443` |
-| `SIGNOZ_INGESTION_KEY` | SigNoz Cloud → Settings → Ingestion. **Writes** telemetry. |
-| `SIGNOZ_REGION` / `SIGNOZ_API_KEY` | SigNoz Cloud → Settings → API Keys. **Reads** it back for the self-observation tools. |
-| `CADENCE_CAPTURE_CONTENT` | Record transcripts as span attributes. Off by default — utterance text is user content. |
-
-cadence works against any OTLP backend; SigNoz is simply where this was built
-and dashboarded.
-
----
-
-## Using the library
+### Instrumenting your own agent
 
 Two lines around an existing session:
 
 ```python
 import cadence
-from google import genai
-
 cadence.configure(service_name="my-voice-agent")
 
-client = genai.Client(api_key=...)
 async with client.aio.live.connect(model=MODEL, config=config) as raw:
-    async with cadence.CadenceSession(raw, model=MODEL) as session:
-        await session.send_realtime_input(audio=chunk)
+    async with cadence.CadenceSession(raw, model=MODEL, prompt_version="v17") as session:
         async for message in session.receive():
-            ...   # unchanged: cadence yields every message through untouched
+            ...   # every message passes through untouched
 ```
 
 `CadenceSession` **wraps** rather than monkey-patches. The Live API surface is
 still moving, and patching a library mid-flight is how instrumentation gets
-silently broken by a minor release. Anything cadence does not explicitly wrap
-passes straight through via `__getattr__`.
-
-Instrumentation never raises into the audio path — a bug in cadence must not
-take down the agent it is watching. There is a test for exactly that.
-
-### Adding a provider
-
-The turn state machine is provider-neutral. Providers ship a translator from
-their wire format into a small event vocabulary
-(`src/cadence/providers/gemini.py`, ~200 lines), and inherit the entire span
-model. OpenAI Realtime is an adapter, not a second implementation.
+silently broken by a minor release. Anything cadence doesn't wrap passes
+through via `__getattr__`.
 
 ---
 
-## SigNoz dashboard
+## Design commitments
 
-```
-dashboards/cadence-voice-agent-dashboard.json
-```
+**Provider neutrality.** The turn state machine consumes a universal event
+vocabulary — speech start/end, interruption, tool execution, playback — and
+never sees a vendor type. `providers/gemini.py` is a ~250-line translator.
+Adding OpenAI Realtime is an adapter, not a second implementation.
 
-Import via **Dashboards → Import JSON**. Eight panels: TTFA percentiles, barge-in
-rate and offset distribution, turns by end reason, turn duration, token spend
-by modality, and audio seconds in both directions.
+**Low overhead, measured.** 1.5 µs per event — about **4.5 ms of CPU per minute
+of conversation**. `tests/test_overhead.py` prints the number; it is a test, not
+a claim.
 
-Regenerate with `python dashboards/build_dashboard.py`.
+**Privacy by design.** Content capture is off by default. Repair and fallback
+detection runs **in-process** on transcripts and exports only the resulting
+classification — the text never leaves unless you explicitly opt in. Enterprises
+can collect every high-value signal here without raw audio or transcripts
+leaving their environment.
 
-### The alert worth having
+**Instrumentation never raises into the agent.** A bug in cadence must not take
+down the thing it is watching. There is a test for exactly that.
 
-**Alerts → New Alert → Metrics**, on `voice.turn.time_to_first_audio.bucket`
-with `spaceAggregation: p95`:
+**Cardinality discipline.** Session and turn ids are *not* metric attributes.
+Unique ids on metric dimensions are the standard way to melt a time-series
+backend; correlation belongs on spans, where it is free.
 
-| Setting | Value | Why |
-|---|---|---|
-| Threshold | `> 800` ms | Past ~800ms the pause is unmistakable. Past ~1.5s users assume they were not heard and repeat themselves — which shows up as a barge-in spike, not a latency alert. |
-| Evaluation | 5 min | Long enough to survive one slow turn. |
+---
+
+## SigNoz integration
+
+| What | Where |
+|---|---|
+| OTLP export (traces + metrics) | `src/cadence/tracing.py` |
+| Foundry install incl. MCP server | `deploy/casting.yaml` |
+| SLO dashboard | `dashboards/cadence-slo-dashboard.json` |
+| Diagnostics dashboard | `dashboards/cadence-voice-agent-dashboard.json` |
+| Query API client (v5 `query_range`) | `app/tools/signoz.py` |
+| Agent tools that read SigNoz back | `app/tools/observability.py` |
+
+Import dashboards via **Dashboards → Import JSON**. Regenerate with
+`python dashboards/build_dashboard.py`.
+
+**Alert worth having:** on `realtime.turn.time_to_first_audio.bucket`,
+`spaceAggregation: p95`, threshold `> 350ms` over 5 minutes.
+
+### The demo agent reads its own telemetry
+
+cadence writes the agent's turns into SigNoz; the agent then queries SigNoz for
+*its own* traces. Ask it how fast it's been responding and it runs a p95 against
+the histogram its own turns populated seconds earlier, then answers out loud.
+
+Because metric export has ingestion lag, the tools fall back to live in-process
+stats for the first minute **and say which source they used**. An agent that
+confidently reports a p95 it doesn't have is worse than one that admits the data
+hasn't landed.
 
 ---
 
 ## Tests
 
 ```bash
-.venv/bin/pytest -q
+.venv/bin/pytest -q            # 33 tests
+.venv/bin/pytest tests/test_overhead.py -s   # prints the overhead number
 ```
 
-Nine scenarios drive the recorder with synthetic events and assert on the spans
-that come out — no API key, microphone, or network required. Each is a case I
-got wrong at least once while building it:
+Nearly every case is one I got wrong at least once:
 
-- clean turn produces the full span tree, correctly parented
 - TTFA measured from end-of-speech, **not** including the user's own speech
 - agent-initiated turns carry **no** TTFA rather than a fabricated one
 - barge-in closes the interrupted turn and opens a new one
 - server interrupt after client detection is **not** double-counted
-- mid-stream tool calls flagged
+- overlap measured separately from barge-in
 - unclosed spans reaped when a socket dies mid-turn
-- metrics recorded
+- containment direction not inverted (the one "higher is better" objective)
+- a broad regression is **not** attributed to any single segment
 - a throwing UI hook never propagates into the audio loop
+
+---
+
+## Honest limitations
+
+- The `realtime.*` conventions are a **proposal**, not a standard. Open
+  questions are listed at the end of [SEMCONV.md](docs/SEMCONV.md).
+- Only the Gemini Live adapter is implemented. `realtime.browser.*` is specified
+  but has no adapter; `realtime.vision.*` is frame counting only.
+- Repair and fallback detection is **heuristic phrase matching**. It will miss
+  politely-worded repairs and occasionally fire on a quotation. It is a trend
+  instrument, not a verdict on any single turn — see `src/cadence/dialogue.py`,
+  which says so at length.
+- `scripts/simulate.py` synthesises **audio timing** to populate dashboards. The
+  recorder, SDK, OTLP export and SigNoz storage it drives are all real, but the
+  conversations are generated, and the repo says so rather than presenting them
+  as production traffic.
+- Multi-party audio is out of scope.
 
 ---
 
@@ -217,36 +267,20 @@ got wrong at least once while building it:
 
 ```
 src/cadence/
-  semconv.py       the voice.* namespace — normative reference
+  semconv.py       the realtime.* schema — versioned public API
   recorder.py      the duplex turn state machine
   events.py        provider-neutral event vocabulary
+  dialogue.py      repair/fallback heuristics, and their limits
+  slo.py           the Conversation SLO
+  analysis.py      regression detection and attribution
   session.py       the wrapper around a live session
-  tracing.py       OTLP wiring
-  metrics.py       instruments
-  providers/
-    gemini.py      Gemini Live → neutral events
-app/
-  main.py          FastAPI bridge: browser ↔ Gemini ↔ cadence
-  tools/           SigNoz query client + self-observation tools
-  static/          the console
-dashboards/        SigNoz dashboard + generator
+  providers/gemini.py
+app/               FastAPI bridge, console, landing page
+dashboards/        SigNoz dashboards + generator
+deploy/            Foundry casting
+scripts/simulate.py
 docs/SEMCONV.md    the specification
 ```
-
----
-
-## Honest limitations
-
-- The `voice.*` conventions are a **proposal**, not a standard. See the open
-  questions at the end of [SEMCONV.md](docs/SEMCONV.md).
-- Only the Gemini Live adapter is implemented. The OpenAI Realtime adapter is
-  designed for but not written.
-- SigNoz stores OTel histograms as `.bucket` series; the query client tries
-  both spellings because this has varied across versions.
-- Multi-party audio is out of scope — these conventions assume one human and
-  one agent.
-
----
 
 ## License
 
