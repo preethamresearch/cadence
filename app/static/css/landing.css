@@ -124,8 +124,19 @@ b { font-weight: 600; color: var(--text); }
   box-shadow: 0 10px 30px -10px rgba(56,189,248,0.65);
 }
 .btn.primary:hover { background: linear-gradient(135deg, var(--sky-soft), var(--sky)); }
-.btn.ghost { border: 1px solid var(--line-hi); color: var(--dim); }
+.btn.ghost { border: 1px solid var(--line-hi); color: var(--dim); gap: 8px; }
 .btn.ghost:hover { background: rgba(255,255,255,0.05); color: var(--text); }
+
+/* Sets expectations before the click rather than after the permission
+   prompt — a visitor who taps and hits a dead end does not come back. */
+.btn-note {
+  font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.06em;
+  text-transform: uppercase; color: var(--faint);
+  padding: 2px 6px; border: 1px solid var(--line); border-radius: 999px;
+}
+.no-setup {
+  margin-top: 14px; font-size: 12.5px; color: var(--faint);
+}
 
 .hero-visual {
   position: relative;

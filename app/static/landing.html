@@ -43,9 +43,14 @@
       all to SigNoz over OTLP.
     </p>
     <div class="hero-actions">
-      <a class="btn primary" href="/console">Open the live console</a>
-      <a class="btn ghost" href="/console?replay=1">Watch a recorded session</a>
+      <!-- Replay is the primary action on purpose: a first-time visitor has no
+           microphone permission granted and no API key, so "open the live
+           console" is a dead end for them. The zero-setup path has to be the
+           one that works on the first click. -->
+      <a class="btn primary" href="/console?replay=1">Watch a live session →</a>
+      <a class="btn ghost" href="/console">Talk to it yourself <span class="btn-note">needs a mic</span></a>
     </div>
+    <p class="no-setup">No signup, no API key — the replay runs a recorded session through the real console.</p>
   </div>
 
   <div class="hero-visual">
