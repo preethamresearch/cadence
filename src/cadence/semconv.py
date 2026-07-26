@@ -1,192 +1,349 @@
-"""Semantic conventions for real-time, full-duplex voice agents.
+"""Semantic conventions for real-time multimodal agents.
 
-The OpenTelemetry GenAI semantic conventions (still pre-1.0 as of mid-2026)
-model generative AI as a *request/response* interaction: a ``chat`` span opens
-when you send a prompt and closes when the completion comes back. That shape
-holds for the HTTP chat-completions world it was designed around.
+**This module is a public API.** Metric and attribute names are the contract
+other people's dashboards, alerts, and queries depend on. Renaming one is a
+breaking change on the same order as removing a function — see
+``SCHEMA_VERSION`` and the stability policy below.
 
-It does not hold for real-time voice agents.
+---
 
-Gemini Live, OpenAI Realtime, and their peers speak over a persistent
-bidirectional WebSocket. Audio flows in both directions *simultaneously*.
-There is no request. There is no response. There is no moment at which one
-side is definitively "done" -- the user can and does talk over the model
-mid-sentence. Consequently:
+The OpenTelemetry GenAI conventions model generative AI as a *request/response*
+call: a ``chat`` span opens when you send a prompt and closes when the
+completion returns. For chat completions that is right.
 
-* There is no natural span boundary. A naive instrumentor produces one
-  enormous span per session, which tells you nothing.
-* The latency metric that matters is not end-to-end duration. It is
-  **time to first audio** -- how long the human sat in silence before hearing
-  a reply. A turn can have excellent total duration and still feel broken.
-* The dominant failure mode has no representation at all: **barge-in**, where
-  the user interrupts the agent. How often it happens, and *how far into* the
-  agent's utterance, is the single strongest signal of conversational quality.
-* Cost accounting breaks. Input is not a countable prompt; it is an open
-  microphone billed per second, plus optional video frames.
+Real-time agents do not work that way. Voice agents, screen-sharing agents,
+camera agents, and computer-use agents all hold a **persistent bidirectional
+stream** where signal flows both directions at once. There is no request, no
+response, and no moment where either side is definitively finished — the human
+can and does interrupt mid-action. Four consequences:
 
-``cadence`` therefore defines a ``voice.*`` namespace that composes with,
-rather than replaces, ``gen_ai.*``. Inference spans keep their standard
-``gen_ai.*`` attributes; the conversational structure wrapped around them is
-described in ``voice.*``.
+1. **There is no span boundary.** Nothing marks a request. Instrument it
+   naively and you get one span per session covering twenty exchanges.
+2. **Duration is the wrong latency metric.** What matters is how long the human
+   waited in silence before *anything* came back, not how long the whole
+   exchange took.
+3. **Interruption has no representation.** The most common failure mode of
+   realtime agents cannot occur in a request/response world, so no convention
+   describes it.
+4. **Cost accounting breaks.** Input is an open microphone or a video stream
+   billed continuously, not a countable prompt.
 
-This module is the normative reference for that namespace. See
-``docs/SEMCONV.md`` for the rendered specification and rationale.
+Everything here lives under a single ``realtime.*`` root, with domain
+sub-namespaces, mirroring how ``gen_ai.*`` covers all of LLM work in
+OpenTelemetry:
+
+===========================  =================================================
+``realtime.session.*``       the connected session and its transport
+``realtime.turn.*``          turn structure, interruption, repair, outcome
+``realtime.audio.*``         speech-specific measurement
+``realtime.vision.*``        camera and screen input
+``realtime.tool.*``          tool execution, including realtime-only cases
+``realtime.browser.*``       browser and computer-use actions
+===========================  =================================================
+
+The single root is deliberate. A standard is only useful if people can
+remember and cite it, and ``realtime.*`` extends to modalities that do not
+exist yet without forcing a rename — which is the failure that kills
+conventions.
+
+``gen_ai.*`` is reused verbatim wherever it already fits: model inference
+inside a turn is still a ``chat`` span with standard GenAI attributes.
+
+Stability policy
+----------------
+* ``SCHEMA_VERSION`` follows semver.
+* Within a major version, names are **never** renamed or repurposed. New
+  attributes may be added; existing ones may be deprecated but keep emitting.
+* Anything marked *experimental* below may change in a minor version.
+* The version is stamped on every exported resource as
+  ``realtime.schema.version`` so a backend can tell which shape it is holding.
+
+Implementation status
+---------------------
+Voice (Gemini Live) is implemented and tested. ``realtime.vision.*`` is
+partially implemented (frame counting). ``realtime.browser.*`` is specified but
+has no adapter yet — the constants exist so one has a fixed target rather than
+inventing its own names. ``docs/SEMCONV.md`` states what is real today.
 """
 
 from __future__ import annotations
 
 from typing import Final
 
-# --------------------------------------------------------------------------
+SCHEMA_VERSION: Final = "0.1.0"
+"""Semver for this convention set. Stamped on every exported resource."""
+
+SCHEMA_URL: Final = "https://github.com/preethamresearch/cadence/schemas/0.1.0"
+
+ATTR_SCHEMA_VERSION: Final = "realtime.schema.version"
+
+
+# ==========================================================================
 # Span names
-# --------------------------------------------------------------------------
-# Named to sit alongside the GenAI convention's fixed span names
-# (`chat`, `invoke_agent`, `execute_tool`) rather than collide with them.
+# ==========================================================================
 
-SPAN_CONVERSATION: Final = "voice.conversation"
-"""Root span. Covers one connected session, from socket open to socket close."""
+SPAN_SESSION: Final = "realtime.session"
+"""Root span. One connected session, stream open to stream close."""
 
-SPAN_TURN: Final = "voice.turn"
-"""One conversational exchange: user speaks, agent responds. Child of conversation."""
+SPAN_TURN: Final = "realtime.turn"
+"""One exchange. Child of the session."""
 
-SPAN_USER_UTTERANCE: Final = "voice.user_utterance"
-"""The span of time the human was speaking. Child of turn."""
+SPAN_USER_UTTERANCE: Final = "realtime.audio.user_utterance"
+SPAN_AGENT_UTTERANCE: Final = "realtime.audio.agent_utterance"
+SPAN_BROWSER_ACTION: Final = "realtime.browser.action"
 
-SPAN_AGENT_UTTERANCE: Final = "voice.agent_utterance"
-"""First audio byte out to playback completion (or interruption). Child of turn."""
-
-# For model inference and tool execution we deliberately reuse the GenAI
-# convention's own span names so existing backends and processors light up.
+# Reused from the GenAI conventions so existing backends light up unchanged.
 SPAN_CHAT: Final = "chat"
 SPAN_EXECUTE_TOOL: Final = "execute_tool"
 
 
-# --------------------------------------------------------------------------
-# Session-scoped attributes
-# --------------------------------------------------------------------------
+# ==========================================================================
+# realtime.session.*
+# ==========================================================================
 
-VOICE_SESSION_ID: Final = "voice.session.id"
-"""Stable identifier for one connected session. Correlates every turn within it."""
+SESSION_ID: Final = "realtime.session.id"
+SESSION_TURN_COUNT: Final = "realtime.session.turn_count"
+SESSION_DURATION_MS: Final = "realtime.session.duration_ms"
 
-VOICE_SESSION_TURN_COUNT: Final = "voice.session.turn_count"
-"""Total turns completed in the session. Set on the conversation span at close."""
+PROVIDER: Final = "realtime.provider"
+"""`gemini_live`, `openai_realtime`, … Distinct from `gen_ai.provider.name`
+because the transport and the model need not come from the same vendor."""
 
-VOICE_PROVIDER: Final = "voice.provider"
-"""Realtime provider: `gemini_live`, `openai_realtime`, ... Distinct from
-`gen_ai.provider.name` because the transport and the model may differ."""
+TRANSPORT: Final = "realtime.transport"
+"""`websocket`, `webrtc`, `pstn`, `sip`.
 
-VOICE_TRANSPORT: Final = "voice.transport"
-"""Underlying transport, e.g. `websocket`, `webrtc`."""
+Worth carrying as a metric dimension: interruption rates on PSTN differ
+sharply from WebRTC, and an aggregate that mixes them hides both."""
 
+MODALITY_INPUT: Final = "realtime.modality.input"
+"""Comma-joined active input modalities: `audio`, `audio,video`, `screen`…"""
 
-# --------------------------------------------------------------------------
-# Turn-scoped attributes
-# --------------------------------------------------------------------------
+MODALITY_OUTPUT: Final = "realtime.modality.output"
 
-VOICE_TURN_ID: Final = "voice.turn.id"
-VOICE_TURN_INDEX: Final = "voice.turn.index"
-"""Zero-based ordinal of this turn within its session."""
+PROMPT_VERSION: Final = "realtime.prompt.version"
+"""Version of the system prompt driving the agent.
 
-VOICE_TURN_TTFA_MS: Final = "voice.turn.time_to_first_audio_ms"
-"""**The** voice latency metric. Milliseconds from the last inbound frame of
-user audio to the first outbound frame of agent audio -- i.e. the duration of
-the silence the human actually experienced.
+The highest-leverage attribute in this file. Realtime quality regressions are
+usually caused by prompt changes rather than infrastructure, and without this
+you cannot attribute a latency or verbosity shift to the deploy that caused
+it. Set it from your build, not by hand."""
 
-Measured at the audio boundary rather than at the model boundary on purpose:
-it captures VAD dwell, network, model queueing, and time-to-first-token
-together, which is what the listener perceives as "did it hear me?"."""
+AGENT_VERSION: Final = "realtime.agent.version"
 
-VOICE_TURN_INTERRUPTED: Final = "voice.turn.interrupted"
-"""True when the user barged in over the agent's reply during this turn."""
+SESSION_OUTCOME: Final = "realtime.session.outcome"
+"""`contained` | `transferred` | `abandoned`. The outcome the business cares
+about; everything else here is a leading indicator of it."""
 
-VOICE_TURN_END_REASON: Final = "voice.turn.end_reason"
-"""One of `completed`, `interrupted`, `tool_handoff`, `session_closed`, `error`."""
-
-VOICE_TURN_TOOL_CALL_COUNT: Final = "voice.turn.tool_call_count"
-"""Tool invocations issued during this turn, including mid-stream ones."""
+SESSION_CONTAINED: Final = "realtime.session.contained"
+"""True when the session ended without handing off to a human."""
 
 
-# --------------------------------------------------------------------------
-# Utterance-scoped attributes
-# --------------------------------------------------------------------------
+# ==========================================================================
+# realtime.turn.*  — modality-agnostic
+# ==========================================================================
 
-VOICE_UTTERANCE_DURATION_MS: Final = "voice.utterance.duration_ms"
-VOICE_UTTERANCE_AUDIO_MS: Final = "voice.utterance.audio_ms"
-"""Decoded audio actually carried, which may be less than wall-clock duration."""
+TURN_ID: Final = "realtime.turn.id"
+TURN_INDEX: Final = "realtime.turn.index"
+TURN_DURATION_MS: Final = "realtime.turn.duration_ms"
+TURN_END_REASON: Final = "realtime.turn.end_reason"
+"""`completed` | `interrupted` | `tool_handoff` | `session_closed` | `error`."""
 
-VOICE_UTTERANCE_ROLE: Final = "voice.utterance.role"
-"""`user` or `agent`."""
+TURN_AGENT_INITIATED: Final = "realtime.turn.agent_initiated"
+TURN_TOOL_CALL_COUNT: Final = "realtime.turn.tool_call_count"
 
-VOICE_UTTERANCE_TRANSCRIPT: Final = "voice.utterance.transcript"
-"""Recorded only when content capture is explicitly enabled, mirroring the
-GenAI convention's opt-in stance on prompt and completion content."""
+TURN_TTFA_MS: Final = "realtime.turn.time_to_first_audio"
+"""**The** realtime latency metric, in milliseconds.
 
-VOICE_UTTERANCE_TRUNCATED: Final = "voice.utterance.truncated"
-"""True when playback was cut short -- the agent had more to say."""
+Measured from the last inbound frame of user audio to the first outbound frame
+of agent audio — deliberately including VAD dwell, network transit, model
+queueing and time-to-first-token, because every one of those is silence to the
+person waiting. Measuring from the model call instead yields a number that
+looks healthy while the agent feels unresponsive.
+
+Omitted entirely on agent-initiated turns: there is no user input to measure
+from, and a fabricated value silently corrupts the percentile."""
+
+TURN_TTFR_MS: Final = "realtime.turn.time_to_first_response"
+"""The modality-agnostic form of the above: time to the agent's first
+observable output of any kind. For a voice agent it equals TTFA; for a
+computer-use agent it is time to first visible action. *Experimental.*"""
+
+TURN_INTERRUPTED: Final = "realtime.turn.interrupted"
+
+# -- interruption ----------------------------------------------------------
+
+EVENT_BARGE_IN: Final = "realtime.barge_in"
+
+TURN_BARGE_IN_OFFSET_MS: Final = "realtime.turn.barge_in_offset_ms"
+"""How far into the agent's output the interruption arrived.
+
+The **distribution** is the diagnostic, not the count. Offsets clustering near
+zero mean detection is firing on noise rather than intent; consistently large
+offsets mean the agent is too verbose. Identical counts, opposite fixes."""
+
+BARGE_IN_SOURCE: Final = "realtime.barge_in.source"
+"""`client_vad` (detected locally during playback) or `server_signal`."""
+
+# -- overlap ---------------------------------------------------------------
+# Distinct from barge-in. Barge-in is the *event* of the user cutting in;
+# overlap is *how long both parties continued at once* before the agent
+# yielded. Long overlap is experienced as being talked over — a worse fault
+# than being slow to start.
+
+TURN_OVERLAP_MS: Final = "realtime.turn.overlap_ms"
+OVERLAP_DURATION_MS: Final = "realtime.overlap.duration_ms"
+
+# -- repair and fallback ---------------------------------------------------
+# The signals closest to *semantic* quality. Everything else measures timing;
+# these measure whether the conversation worked. Detected heuristically from
+# transcripts — see `cadence.dialogue` for the method and its stated limits.
+#
+# Privacy: detection runs in-process on the transcript and exports only the
+# resulting classification. The transcript text itself never leaves the
+# process unless content capture is explicitly enabled.
+
+EVENT_REPAIR: Final = "realtime.repair"
+REPAIR_TYPE: Final = "realtime.repair.type"
+TURN_REPAIR: Final = "realtime.turn.repair"
+"""True when this turn contains a user repair — meaning the previous turn
+failed to land."""
+
+EVENT_FALLBACK: Final = "realtime.fallback"
+FALLBACK_REASON: Final = "realtime.fallback.reason"
+TURN_FALLBACK: Final = "realtime.turn.fallback"
+
+EVENT_HANDOFF: Final = "realtime.handoff"
+HANDOFF_REASON: Final = "realtime.handoff.reason"
+
+# -- silence ---------------------------------------------------------------
+
+TURN_SILENCE_MS: Final = "realtime.turn.silence_ms"
+SESSION_SILENCE_SECONDS: Final = "realtime.session.silence_seconds"
+SESSION_SILENCE_RATIO: Final = "realtime.session.silence_ratio"
+"""Fraction of the session in which neither party was active. A conversation
+that is 70% dead air is failing however good its p95 looks."""
+
+GENERATION_CANCELLED: Final = "realtime.turn.generation_cancelled"
+"""Model generation abandoned before completing, usually by a barge-in. Tokens
+were billed for output nobody received."""
 
 
-# --------------------------------------------------------------------------
-# Barge-in
-# --------------------------------------------------------------------------
-# Modelled as a span event on the agent utterance that got cut off, so the
-# interruption is visible at the exact point in the waterfall where it landed.
+# ==========================================================================
+# realtime.audio.*
+# ==========================================================================
 
-EVENT_BARGE_IN: Final = "voice.barge_in"
+AUDIO_UTTERANCE_ROLE: Final = "realtime.audio.utterance.role"
+AUDIO_UTTERANCE_DURATION_MS: Final = "realtime.audio.utterance.duration_ms"
+AUDIO_UTTERANCE_AUDIO_MS: Final = "realtime.audio.utterance.audio_ms"
+"""Decoded audio carried, which may be less than wall-clock duration."""
 
-VOICE_BARGE_IN_OFFSET_MS: Final = "voice.barge_in.offset_ms"
-"""How far into the agent's utterance the interruption arrived. Near-zero
-offsets cluster when the agent is misfiring on VAD noise; large offsets mean
-the agent is being too verbose. The distribution is diagnostic; the raw count
-is not."""
+AUDIO_UTTERANCE_TRUNCATED: Final = "realtime.audio.utterance.truncated"
+AUDIO_UTTERANCE_TRANSCRIPT: Final = "realtime.audio.utterance.transcript"
+"""Opt-in only, mirroring the GenAI conventions' stance on content capture."""
 
-VOICE_BARGE_IN_SOURCE: Final = "voice.barge_in.source"
-"""`client_vad` when detected locally from inbound audio during playback, or
-`server_signal` when the provider reported the interruption."""
+AUDIO_INPUT_SECONDS: Final = "realtime.audio.input_seconds"
+AUDIO_OUTPUT_SECONDS: Final = "realtime.audio.output_seconds"
+AUDIO_SAMPLE_RATE: Final = "realtime.audio.sample_rate"
 
+AUDIO_STREAM_GAP_MS: Final = "realtime.audio.stream.gap_ms"
+"""Longest pause between consecutive agent audio chunks inside one utterance.
 
-# --------------------------------------------------------------------------
-# Modality and cost
-# --------------------------------------------------------------------------
-# Realtime input is a continuously open microphone, not a countable prompt,
-# so seconds-of-audio is the unit that actually maps to spend.
+Distinct from time-to-first-audio, which measures the delay *before* speech
+starts. This catches stutter *during* speech — the model or network stalling
+mid-sentence — which listeners find worse than a slow start, because it sounds
+like malfunction rather than thought."""
 
-VOICE_MODALITY_INPUT: Final = "voice.modality.input"
-"""Comma-joined active input modalities, e.g. `audio` or `audio,video`."""
+TURN_MAX_STREAM_GAP_MS: Final = "realtime.turn.max_stream_gap_ms"
 
-VOICE_MODALITY_OUTPUT: Final = "voice.modality.output"
-
-VOICE_AUDIO_INPUT_SECONDS: Final = "voice.audio.input_seconds"
-VOICE_AUDIO_OUTPUT_SECONDS: Final = "voice.audio.output_seconds"
-
-VOICE_VIDEO_FRAMES: Final = "voice.video.frames"
-"""Video frames forwarded to the model. Easy to overlook and expensive: an
-agent streaming 1fps for a ten-minute session ships 600 images."""
+AUDIO_VOICE_ID: Final = "realtime.audio.voice.id"
+AUDIO_VOICE_SWITCHED: Final = "realtime.audio.voice.switched"
+"""True when the synthesis voice changed mid-session. Almost always a bug, and
+disconcerting to hear."""
 
 
-# --------------------------------------------------------------------------
-# Metric instrument names
-# --------------------------------------------------------------------------
+# ==========================================================================
+# realtime.vision.*
+# ==========================================================================
 
-METRIC_TTFA: Final = "voice.turn.time_to_first_audio"
-METRIC_TURN_DURATION: Final = "voice.turn.duration"
-METRIC_TURN_COUNT: Final = "voice.turn.count"
-METRIC_BARGE_IN_COUNT: Final = "voice.barge_in.count"
-METRIC_BARGE_IN_OFFSET: Final = "voice.barge_in.offset"
-METRIC_AUDIO_INPUT_SECONDS: Final = "voice.audio.input.seconds"
-METRIC_AUDIO_OUTPUT_SECONDS: Final = "voice.audio.output.seconds"
-METRIC_VIDEO_FRAMES: Final = "voice.video.frames"
-METRIC_SESSION_COUNT: Final = "voice.session.count"
+VISION_FRAMES: Final = "realtime.vision.frames"
+"""Frames forwarded to the model. Easy to overlook and expensive: an agent
+streaming 1fps for ten minutes ships 600 images."""
+
+VISION_FPS: Final = "realtime.vision.fps"
+VISION_SOURCE: Final = "realtime.vision.source"
+"""`camera` | `screen` | `window`."""
+VISION_RESOLUTION: Final = "realtime.vision.resolution"
+
+
+# ==========================================================================
+# realtime.tool.*
+# ==========================================================================
+
+TOOL_NAME: Final = "realtime.tool.name"
+TOOL_DURATION_MS: Final = "realtime.tool.duration_ms"
+
+TOOL_MID_STREAM: Final = "realtime.tool.mid_stream"
+"""Tool fired while the agent was still producing output — a realtime-only
+phenomenon and a common source of confusing latency."""
+
+TOOL_INTERRUPTED: Final = "realtime.tool.interrupted"
+"""Tool was still running when the turn ended. Its result was discarded and
+whatever it cost was wasted. A rising rate means tools are slower than users
+are patient."""
+
+TOOL_RETRY_COUNT: Final = "realtime.tool.retry_count"
+TOOL_ERROR: Final = "realtime.tool.error"
+
+
+# ==========================================================================
+# realtime.browser.*   (specified; adapter not yet implemented)
+# ==========================================================================
+
+BROWSER_ACTION_TYPE: Final = "realtime.browser.action.type"
+"""`click` | `type` | `navigate` | `scroll` | `screenshot` | `key`."""
+
+BROWSER_ACTION_DURATION_MS: Final = "realtime.browser.action.duration_ms"
+BROWSER_URL: Final = "realtime.browser.url"
+BROWSER_TARGET: Final = "realtime.browser.target"
+BROWSER_ACTION_FAILED: Final = "realtime.browser.action.failed"
+
+
+# ==========================================================================
+# Metric instruments
+# ==========================================================================
+
+METRIC_TTFA: Final = "realtime.turn.time_to_first_audio"
+METRIC_TTFR: Final = "realtime.turn.time_to_first_response"
+METRIC_TURN_DURATION: Final = "realtime.turn.duration"
+METRIC_TURN_COUNT: Final = "realtime.turn.count"
+METRIC_BARGE_IN_COUNT: Final = "realtime.barge_in.count"
+METRIC_BARGE_IN_OFFSET: Final = "realtime.barge_in.offset"
+METRIC_OVERLAP_DURATION: Final = "realtime.overlap.duration"
+METRIC_REPAIR_COUNT: Final = "realtime.repair.count"
+METRIC_FALLBACK_COUNT: Final = "realtime.fallback.count"
+METRIC_HANDOFF_COUNT: Final = "realtime.handoff.count"
+METRIC_SILENCE_SECONDS: Final = "realtime.silence.seconds"
+
+METRIC_SESSION_COUNT: Final = "realtime.session.count"
+METRIC_SESSION_OUTCOME: Final = "realtime.session.outcome.count"
+
+METRIC_AUDIO_INPUT_SECONDS: Final = "realtime.audio.input.seconds"
+METRIC_AUDIO_OUTPUT_SECONDS: Final = "realtime.audio.output.seconds"
+METRIC_STREAM_GAP: Final = "realtime.audio.stream.gap"
+
+METRIC_VISION_FRAMES: Final = "realtime.vision.frames"
+
+METRIC_TOOL_DURATION: Final = "realtime.tool.duration"
+METRIC_TOOL_RETRIES: Final = "realtime.tool.retries"
 
 # Reused verbatim from the GenAI conventions so token spend aggregates
 # alongside every other instrumented model call in the backend.
 METRIC_TOKEN_USAGE: Final = "gen_ai.client.token.usage"
 
 
-# --------------------------------------------------------------------------
-# GenAI attributes we set on inference spans
-# --------------------------------------------------------------------------
-# Mirrored here as constants so the package has no hard dependency on the
-# semconv package's own release cadence, which is still moving.
+# ==========================================================================
+# gen_ai.*  — reused as-is
+# ==========================================================================
 
 GEN_AI_PROVIDER_NAME: Final = "gen_ai.provider.name"
 GEN_AI_OPERATION_NAME: Final = "gen_ai.operation.name"
@@ -196,13 +353,14 @@ GEN_AI_RESPONSE_FINISH_REASONS: Final = "gen_ai.response.finish_reasons"
 GEN_AI_USAGE_INPUT_TOKENS: Final = "gen_ai.usage.input_tokens"
 GEN_AI_USAGE_OUTPUT_TOKENS: Final = "gen_ai.usage.output_tokens"
 GEN_AI_TOKEN_TYPE: Final = "gen_ai.token.type"
+GEN_AI_TOKEN_MODALITY: Final = "gen_ai.token.modality"
 GEN_AI_TOOL_NAME: Final = "gen_ai.tool.name"
 GEN_AI_CONVERSATION_ID: Final = "gen_ai.conversation.id"
 
 
-# --------------------------------------------------------------------------
+# ==========================================================================
 # Enumerated values
-# --------------------------------------------------------------------------
+# ==========================================================================
 
 
 class EndReason:
@@ -221,3 +379,38 @@ class Role:
 class BargeInSource:
     CLIENT_VAD: Final = "client_vad"
     SERVER_SIGNAL: Final = "server_signal"
+
+
+class RepairType:
+    REPETITION: Final = "repetition"
+    """User restated what they already said."""
+    CORRECTION: Final = "correction"
+    """User contradicted what the agent did or said."""
+    CLARIFICATION_REQUEST: Final = "clarification_request"
+    """User asked the agent to repeat or explain itself."""
+
+
+class FallbackReason:
+    NOT_UNDERSTOOD: Final = "not_understood"
+    NO_CAPABILITY: Final = "no_capability"
+    HANDOFF: Final = "handoff"
+
+
+class Outcome:
+    CONTAINED: Final = "contained"
+    TRANSFERRED: Final = "transferred"
+    ABANDONED: Final = "abandoned"
+
+
+class Modality:
+    AUDIO: Final = "audio"
+    VIDEO: Final = "video"
+    SCREEN: Final = "screen"
+    TEXT: Final = "text"
+
+
+class Transport:
+    WEBSOCKET: Final = "websocket"
+    WEBRTC: Final = "webrtc"
+    PSTN: Final = "pstn"
+    SIP: Final = "sip"

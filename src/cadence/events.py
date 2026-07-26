@@ -27,6 +27,10 @@ class EventType(enum.Enum):
     AGENT_AUDIO_CHUNK = "agent_audio_chunk"
     AGENT_TRANSCRIPT = "agent_transcript"
     AGENT_GENERATION_COMPLETE = "agent_generation_complete"
+    PLAYBACK_FINISHED = "playback_finished"
+    """Agent output stopped reaching the user. Ends overlap and begins dead
+    air. Distinct from generation completing: the model can finish producing
+    while audio is still playing out."""
 
     # Turn control
     INTERRUPTED = "interrupted"

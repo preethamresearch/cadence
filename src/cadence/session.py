@@ -19,6 +19,7 @@ import logging
 import time
 from typing import Any, AsyncIterator
 
+from . import semconv
 from .events import EventType, VoiceEvent
 from .providers import gemini
 from .recorder import ConversationRecorder, EventHook
@@ -40,6 +41,9 @@ class CadenceSession:
         model: str | None = None,
         session_id: str | None = None,
         capture_content: bool = False,
+        prompt_version: str | None = None,
+        agent_version: str | None = None,
+        transport: str = semconv.Transport.WEBSOCKET,
         on_event: EventHook | None = None,
         recorder: ConversationRecorder | None = None,
     ) -> None:
@@ -48,9 +52,12 @@ class CadenceSession:
             session_id=session_id,
             provider=gemini.PROVIDER,
             model=model,
+            transport=transport,
+            # Carrying the prompt version is what turns "latency regressed"
+            # into "latency regressed when v17 shipped".
+            prompt_version=prompt_version,
+            agent_version=agent_version,
             capture_content=capture_content,
-            input_sample_rate=gemini.INPUT_SAMPLE_RATE,
-            output_sample_rate=gemini.OUTPUT_SAMPLE_RATE,
             on_event=on_event,
         )
         self._started = False

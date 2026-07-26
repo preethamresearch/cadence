@@ -1,0 +1,614 @@
+{
+  "description": "The six objectives that define whether a realtime agent is acceptable: time to first audio, interruptions, overlap, containment, repair rate, and human transfer. Targets drawn on each panel.",
+  "layout": [
+    {
+      "h": 6,
+      "i": "c8803e4b-e320-57b4-817d-756990b33757",
+      "moved": false,
+      "static": false,
+      "w": 6,
+      "x": 0,
+      "y": 0
+    },
+    {
+      "h": 6,
+      "i": "0eeea8e0-72d5-51a5-8737-352634f7e131",
+      "moved": false,
+      "static": false,
+      "w": 6,
+      "x": 6,
+      "y": 0
+    },
+    {
+      "h": 6,
+      "i": "a5c2468e-1be5-5c22-8693-4f5e55ca99dd",
+      "moved": false,
+      "static": false,
+      "w": 6,
+      "x": 0,
+      "y": 6
+    },
+    {
+      "h": 6,
+      "i": "a66c0d8c-d823-577c-87c0-bbae796c92a6",
+      "moved": false,
+      "static": false,
+      "w": 6,
+      "x": 6,
+      "y": 6
+    },
+    {
+      "h": 6,
+      "i": "5b52726c-b0f2-5a25-a115-5059cb736d3f",
+      "moved": false,
+      "static": false,
+      "w": 6,
+      "x": 0,
+      "y": 12
+    },
+    {
+      "h": 6,
+      "i": "4b626262-4e91-5320-9880-2e1fff839612",
+      "moved": false,
+      "static": false,
+      "w": 6,
+      "x": 6,
+      "y": 12
+    }
+  ],
+  "name": "Cadence \u2014 Conversation SLO",
+  "tags": [
+    "cadence",
+    "slo",
+    "voice",
+    "realtime"
+  ],
+  "title": "Cadence \u2014 Conversation SLO",
+  "variables": {},
+  "version": "v4",
+  "widgets": [
+    {
+      "description": "The silence the user sat through. Turn-taking between humans runs to roughly 200ms; past 350ms the pause registers as hesitation, and past a second users assume they were not heard and repeat themselves.",
+      "id": "c8803e4b-e320-57b4-817d-756990b33757",
+      "isStacked": false,
+      "nullZeroValues": "zero",
+      "opacity": "1",
+      "panelTypes": "graph",
+      "query": {
+        "builder": {
+          "queryData": [
+            {
+              "dataSource": "metrics",
+              "disabled": false,
+              "expression": "A",
+              "functions": [],
+              "groupBy": [],
+              "having": {
+                "expression": ""
+              },
+              "legend": "p95",
+              "limit": null,
+              "orderBy": [],
+              "queryName": "A",
+              "stepInterval": 60,
+              "aggregations": [
+                {
+                  "metricName": "realtime.turn.time_to_first_audio.bucket",
+                  "temporality": null,
+                  "timeAggregation": "",
+                  "spaceAggregation": "p95",
+                  "reduceTo": "avg"
+                }
+              ],
+              "filter": {
+                "expression": ""
+              }
+            },
+            {
+              "dataSource": "metrics",
+              "disabled": false,
+              "expression": "B",
+              "functions": [],
+              "groupBy": [],
+              "having": {
+                "expression": ""
+              },
+              "legend": "p50",
+              "limit": null,
+              "orderBy": [],
+              "queryName": "B",
+              "stepInterval": 60,
+              "aggregations": [
+                {
+                  "metricName": "realtime.turn.time_to_first_audio.bucket",
+                  "temporality": null,
+                  "timeAggregation": "",
+                  "spaceAggregation": "p50",
+                  "reduceTo": "avg"
+                }
+              ],
+              "filter": {
+                "expression": ""
+              }
+            }
+          ],
+          "queryFormulas": []
+        },
+        "clickhouse_sql": [
+          {
+            "disabled": false,
+            "legend": "",
+            "name": "A",
+            "query": ""
+          }
+        ],
+        "id": "473833aa-cf26-5076-81ea-37e2c869505d",
+        "promql": [
+          {
+            "disabled": false,
+            "legend": "",
+            "name": "A",
+            "query": ""
+          }
+        ],
+        "queryType": "builder"
+      },
+      "thresholds": [
+        {
+          "index": "a710e9e3-89f1-563a-8eb4-9ade6fc2335f",
+          "keyIndex": 0,
+          "moveThreshold": false,
+          "selectedGraph": "graph",
+          "thresholdColor": "#FB7185",
+          "thresholdFormat": "Text",
+          "thresholdLabel": "SLO 350ms",
+          "thresholdOperator": ">",
+          "thresholdTableOptions": "",
+          "thresholdUnit": "",
+          "thresholdValue": 350
+        }
+      ],
+      "timePreferance": "GLOBAL_TIME",
+      "title": "SLO \u00b7 Time to first audio p95  (target < 350ms)",
+      "yAxisUnit": "ms"
+    },
+    {
+      "description": "Under one per session is normal turn-taking. Above it, users are fighting the agent for the floor rather than talking to it.",
+      "id": "0eeea8e0-72d5-51a5-8737-352634f7e131",
+      "isStacked": false,
+      "nullZeroValues": "zero",
+      "opacity": "1",
+      "panelTypes": "graph",
+      "query": {
+        "builder": {
+          "queryData": [
+            {
+              "dataSource": "metrics",
+              "disabled": false,
+              "expression": "A",
+              "functions": [],
+              "groupBy": [],
+              "having": {
+                "expression": ""
+              },
+              "legend": "barge-ins",
+              "limit": null,
+              "orderBy": [],
+              "queryName": "A",
+              "stepInterval": 60,
+              "aggregations": [
+                {
+                  "metricName": "realtime.barge_in.count",
+                  "temporality": null,
+                  "timeAggregation": "rate",
+                  "spaceAggregation": "sum",
+                  "reduceTo": "avg"
+                }
+              ],
+              "filter": {
+                "expression": ""
+              }
+            }
+          ],
+          "queryFormulas": []
+        },
+        "clickhouse_sql": [
+          {
+            "disabled": false,
+            "legend": "",
+            "name": "A",
+            "query": ""
+          }
+        ],
+        "id": "480783c5-097b-5e15-9ee4-8db2bd9abad3",
+        "promql": [
+          {
+            "disabled": false,
+            "legend": "",
+            "name": "A",
+            "query": ""
+          }
+        ],
+        "queryType": "builder"
+      },
+      "thresholds": [
+        {
+          "index": "1186d537-06f4-5acf-bd72-09b9d99d5a82",
+          "keyIndex": 0,
+          "moveThreshold": false,
+          "selectedGraph": "graph",
+          "thresholdColor": "#FB7185",
+          "thresholdFormat": "Text",
+          "thresholdLabel": "SLO 0.8",
+          "thresholdOperator": ">",
+          "thresholdTableOptions": "",
+          "thresholdUnit": "",
+          "thresholdValue": 0.8
+        }
+      ],
+      "timePreferance": "GLOBAL_TIME",
+      "title": "SLO \u00b7 Interruptions per session  (target < 0.8)",
+      "yAxisUnit": ""
+    },
+    {
+      "description": "How long the agent keeps talking after the user starts. Beyond ~150ms the agent is talking over people, which users find ruder than slowness.",
+      "id": "a5c2468e-1be5-5c22-8693-4f5e55ca99dd",
+      "isStacked": false,
+      "nullZeroValues": "zero",
+      "opacity": "1",
+      "panelTypes": "graph",
+      "query": {
+        "builder": {
+          "queryData": [
+            {
+              "dataSource": "metrics",
+              "disabled": false,
+              "expression": "A",
+              "functions": [],
+              "groupBy": [],
+              "having": {
+                "expression": ""
+              },
+              "legend": "p50",
+              "limit": null,
+              "orderBy": [],
+              "queryName": "A",
+              "stepInterval": 60,
+              "aggregations": [
+                {
+                  "metricName": "realtime.overlap.duration.bucket",
+                  "temporality": null,
+                  "timeAggregation": "",
+                  "spaceAggregation": "p50",
+                  "reduceTo": "avg"
+                }
+              ],
+              "filter": {
+                "expression": ""
+              }
+            },
+            {
+              "dataSource": "metrics",
+              "disabled": false,
+              "expression": "B",
+              "functions": [],
+              "groupBy": [],
+              "having": {
+                "expression": ""
+              },
+              "legend": "p90",
+              "limit": null,
+              "orderBy": [],
+              "queryName": "B",
+              "stepInterval": 60,
+              "aggregations": [
+                {
+                  "metricName": "realtime.overlap.duration.bucket",
+                  "temporality": null,
+                  "timeAggregation": "",
+                  "spaceAggregation": "p90",
+                  "reduceTo": "avg"
+                }
+              ],
+              "filter": {
+                "expression": ""
+              }
+            }
+          ],
+          "queryFormulas": []
+        },
+        "clickhouse_sql": [
+          {
+            "disabled": false,
+            "legend": "",
+            "name": "A",
+            "query": ""
+          }
+        ],
+        "id": "b36b09f7-ef9a-5bef-9cb1-08a8eb598da1",
+        "promql": [
+          {
+            "disabled": false,
+            "legend": "",
+            "name": "A",
+            "query": ""
+          }
+        ],
+        "queryType": "builder"
+      },
+      "thresholds": [
+        {
+          "index": "551366f0-cd07-5026-9a71-4f2a6aa362fc",
+          "keyIndex": 0,
+          "moveThreshold": false,
+          "selectedGraph": "graph",
+          "thresholdColor": "#FB7185",
+          "thresholdFormat": "Text",
+          "thresholdLabel": "SLO 150ms",
+          "thresholdOperator": ">",
+          "thresholdTableOptions": "",
+          "thresholdUnit": "",
+          "thresholdValue": 150
+        }
+      ],
+      "timePreferance": "GLOBAL_TIME",
+      "title": "SLO \u00b7 Mean speech overlap  (target < 150ms)",
+      "yAxisUnit": "ms"
+    },
+    {
+      "description": "Share of sessions resolved without a human. The number the deployment is funded on: below target the agent adds a step rather than removing one.",
+      "id": "a66c0d8c-d823-577c-87c0-bbae796c92a6",
+      "isStacked": true,
+      "nullZeroValues": "zero",
+      "opacity": "1",
+      "panelTypes": "graph",
+      "query": {
+        "builder": {
+          "queryData": [
+            {
+              "dataSource": "metrics",
+              "disabled": false,
+              "expression": "A",
+              "functions": [],
+              "groupBy": [
+                {
+                  "dataType": "string",
+                  "id": "realtime.session.outcome--string--tag--false",
+                  "isColumn": false,
+                  "isJSON": false,
+                  "key": "realtime.session.outcome",
+                  "type": "tag"
+                }
+              ],
+              "having": {
+                "expression": ""
+              },
+              "legend": "{{realtime.session.outcome}}",
+              "limit": null,
+              "orderBy": [],
+              "queryName": "A",
+              "stepInterval": 60,
+              "aggregations": [
+                {
+                  "metricName": "realtime.session.outcome.count",
+                  "temporality": null,
+                  "timeAggregation": "rate",
+                  "spaceAggregation": "sum",
+                  "reduceTo": "avg"
+                }
+              ],
+              "filter": {
+                "expression": ""
+              }
+            }
+          ],
+          "queryFormulas": []
+        },
+        "clickhouse_sql": [
+          {
+            "disabled": false,
+            "legend": "",
+            "name": "A",
+            "query": ""
+          }
+        ],
+        "id": "6cbe61fd-d249-5692-9a8e-6391c1620e7b",
+        "promql": [
+          {
+            "disabled": false,
+            "legend": "",
+            "name": "A",
+            "query": ""
+          }
+        ],
+        "queryType": "builder"
+      },
+      "thresholds": [],
+      "timePreferance": "GLOBAL_TIME",
+      "title": "SLO \u00b7 Session outcomes  (containment target > 72%)",
+      "yAxisUnit": ""
+    },
+    {
+      "description": "Turns where the user had to repeat, correct, or ask again \u2014 the closest available proxy for whether the conversation actually worked.",
+      "id": "5b52726c-b0f2-5a25-a115-5059cb736d3f",
+      "isStacked": false,
+      "nullZeroValues": "zero",
+      "opacity": "1",
+      "panelTypes": "graph",
+      "query": {
+        "builder": {
+          "queryData": [
+            {
+              "dataSource": "metrics",
+              "disabled": false,
+              "expression": "A",
+              "functions": [],
+              "groupBy": [],
+              "having": {
+                "expression": ""
+              },
+              "legend": "repairs",
+              "limit": null,
+              "orderBy": [],
+              "queryName": "A",
+              "stepInterval": 60,
+              "aggregations": [
+                {
+                  "metricName": "realtime.repair.count",
+                  "temporality": null,
+                  "timeAggregation": "rate",
+                  "spaceAggregation": "sum",
+                  "reduceTo": "avg"
+                }
+              ],
+              "filter": {
+                "expression": ""
+              }
+            },
+            {
+              "dataSource": "metrics",
+              "disabled": false,
+              "expression": "B",
+              "functions": [],
+              "groupBy": [],
+              "having": {
+                "expression": ""
+              },
+              "legend": "turns",
+              "limit": null,
+              "orderBy": [],
+              "queryName": "B",
+              "stepInterval": 60,
+              "aggregations": [
+                {
+                  "metricName": "realtime.turn.count",
+                  "temporality": null,
+                  "timeAggregation": "rate",
+                  "spaceAggregation": "sum",
+                  "reduceTo": "avg"
+                }
+              ],
+              "filter": {
+                "expression": ""
+              }
+            }
+          ],
+          "queryFormulas": []
+        },
+        "clickhouse_sql": [
+          {
+            "disabled": false,
+            "legend": "",
+            "name": "A",
+            "query": ""
+          }
+        ],
+        "id": "a19aafc5-5e5c-52ab-b7ac-f1ea54d34dfb",
+        "promql": [
+          {
+            "disabled": false,
+            "legend": "",
+            "name": "A",
+            "query": ""
+          }
+        ],
+        "queryType": "builder"
+      },
+      "thresholds": [],
+      "timePreferance": "GLOBAL_TIME",
+      "title": "SLO \u00b7 Repair turns  (target < 9% of turns)",
+      "yAxisUnit": ""
+    },
+    {
+      "description": "Escalations to a human. Distinct from containment: a session can fail without transferring, if the user simply hangs up.",
+      "id": "4b626262-4e91-5320-9880-2e1fff839612",
+      "isStacked": false,
+      "nullZeroValues": "zero",
+      "opacity": "1",
+      "panelTypes": "graph",
+      "query": {
+        "builder": {
+          "queryData": [
+            {
+              "dataSource": "metrics",
+              "disabled": false,
+              "expression": "A",
+              "functions": [],
+              "groupBy": [],
+              "having": {
+                "expression": ""
+              },
+              "legend": "handoffs",
+              "limit": null,
+              "orderBy": [],
+              "queryName": "A",
+              "stepInterval": 60,
+              "aggregations": [
+                {
+                  "metricName": "realtime.handoff.count",
+                  "temporality": null,
+                  "timeAggregation": "rate",
+                  "spaceAggregation": "sum",
+                  "reduceTo": "avg"
+                }
+              ],
+              "filter": {
+                "expression": ""
+              }
+            },
+            {
+              "dataSource": "metrics",
+              "disabled": false,
+              "expression": "B",
+              "functions": [],
+              "groupBy": [],
+              "having": {
+                "expression": ""
+              },
+              "legend": "sessions",
+              "limit": null,
+              "orderBy": [],
+              "queryName": "B",
+              "stepInterval": 60,
+              "aggregations": [
+                {
+                  "metricName": "realtime.session.count",
+                  "temporality": null,
+                  "timeAggregation": "rate",
+                  "spaceAggregation": "sum",
+                  "reduceTo": "avg"
+                }
+              ],
+              "filter": {
+                "expression": ""
+              }
+            }
+          ],
+          "queryFormulas": []
+        },
+        "clickhouse_sql": [
+          {
+            "disabled": false,
+            "legend": "",
+            "name": "A",
+            "query": ""
+          }
+        ],
+        "id": "ffb7c877-97c8-50de-8724-53b7d2da1ee9",
+        "promql": [
+          {
+            "disabled": false,
+            "legend": "",
+            "name": "A",
+            "query": ""
+          }
+        ],
+        "queryType": "builder"
+      },
+      "thresholds": [],
+      "timePreferance": "GLOBAL_TIME",
+      "title": "SLO \u00b7 Human transfer  (target < 11%)",
+      "yAxisUnit": ""
+    }
+  ]
+}

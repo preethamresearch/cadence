@@ -1,8 +1,15 @@
-"""Metric instruments for real-time voice agents.
+"""Metric instruments.
 
-Traces tell you what happened in one conversation. These instruments tell you
-whether the agent is healthy across all of them -- and they are what the SigNoz
-dashboard and the TTFA alert are built on.
+Traces explain one conversation. These explain whether the fleet is healthy,
+and they are what the SigNoz dashboard and the conversation SLOs are built on.
+
+Every instrument here is deliberately low-cardinality. Session and turn ids are
+*not* metric attributes — unique ids on metric dimensions are the standard way
+to melt a time-series backend. Correlation belongs on spans, where it is free.
+
+The dimensions that *are* carried — provider, model, prompt version, transport
+— are bounded and are exactly the ones you need to answer "which deploy caused
+this?" without a second query.
 """
 
 from __future__ import annotations
@@ -20,80 +27,138 @@ from .tracing import get_meter
 class VoiceMetrics:
     """Lazily-created instrument bundle.
 
-    Instruments are cheap but not free, and creating them at import time would
-    bind to whatever meter provider happened to exist then -- which, for a
-    library, is usually the no-op one. Created on first use instead.
+    Created on first use rather than at import time: a library that builds
+    instruments at import binds to whatever meter provider happens to exist
+    then, which for a library is usually the no-op one.
     """
 
-    ttfa: Histogram
+    # conversation
+    ttfr: Histogram
     turn_duration: Histogram
     turn_count: Counter
     barge_in_count: Counter
     barge_in_offset: Histogram
+    overlap_duration: Histogram
+    repair_count: Counter
+    fallback_count: Counter
+    handoff_count: Counter
+    outcome_count: Counter
+    silence_seconds: Counter
+
+    # audio
+    ttfa: Histogram
     audio_input_seconds: Counter
     audio_output_seconds: Counter
-    video_frames: Counter
+    stream_gap: Histogram
+
+    # vision
+    vision_frames: Counter
+
+    # tool
+    tool_duration: Histogram
+    tool_retries: Counter
+
+    # realtime
     session_count: Counter
     token_usage: Counter
 
     @classmethod
     def create(cls) -> VoiceMetrics:
-        meter = get_meter()
+        m = get_meter()
         return cls(
-            ttfa=meter.create_histogram(
-                semconv.METRIC_TTFA,
-                unit="ms",
+            ttfr=m.create_histogram(
+                semconv.METRIC_TTFR, unit="ms",
+                description=(
+                    "Delay between the user finishing input and the agent's first "
+                    "observable output, in any modality."
+                ),
+            ),
+            turn_duration=m.create_histogram(
+                semconv.METRIC_TURN_DURATION, unit="ms",
+                description="Wall-clock duration of a complete turn.",
+            ),
+            turn_count=m.create_counter(
+                semconv.METRIC_TURN_COUNT, unit="{turn}",
+                description="Turns completed, by end reason.",
+            ),
+            barge_in_count=m.create_counter(
+                semconv.METRIC_BARGE_IN_COUNT, unit="{event}",
+                description="Times the user interrupted the agent.",
+            ),
+            barge_in_offset=m.create_histogram(
+                semconv.METRIC_BARGE_IN_OFFSET, unit="ms",
+                description=(
+                    "How far into the agent's output an interruption landed. Low "
+                    "values suggest detection misfires; high values suggest verbosity."
+                ),
+            ),
+            overlap_duration=m.create_histogram(
+                semconv.METRIC_OVERLAP_DURATION, unit="ms",
+                description=(
+                    "How long both parties were active at once before the agent "
+                    "yielded. Long overlap is experienced as being talked over."
+                ),
+            ),
+            repair_count=m.create_counter(
+                semconv.METRIC_REPAIR_COUNT, unit="{event}",
+                description="User repairs — the previous turn failed to land.",
+            ),
+            fallback_count=m.create_counter(
+                semconv.METRIC_FALLBACK_COUNT, unit="{event}",
+                description="Agent gave up rather than answering.",
+            ),
+            handoff_count=m.create_counter(
+                semconv.METRIC_HANDOFF_COUNT, unit="{event}",
+                description="Escalations to a human.",
+            ),
+            outcome_count=m.create_counter(
+                semconv.METRIC_SESSION_OUTCOME, unit="{session}",
+                description="Sessions by outcome: contained, transferred, abandoned.",
+            ),
+            silence_seconds=m.create_counter(
+                semconv.METRIC_SILENCE_SECONDS, unit="s",
+                description="Seconds in which neither party was active.",
+            ),
+            ttfa=m.create_histogram(
+                semconv.METRIC_TTFA, unit="ms",
                 description=(
                     "Silence the user experienced between finishing speaking and "
                     "hearing the first audio of the reply."
                 ),
             ),
-            turn_duration=meter.create_histogram(
-                semconv.METRIC_TURN_DURATION,
-                unit="ms",
-                description="Wall-clock duration of a complete conversational turn.",
-            ),
-            turn_count=meter.create_counter(
-                semconv.METRIC_TURN_COUNT,
-                unit="{turn}",
-                description="Conversational turns completed, by end reason.",
-            ),
-            barge_in_count=meter.create_counter(
-                semconv.METRIC_BARGE_IN_COUNT,
-                unit="{event}",
-                description="Times the user interrupted the agent mid-utterance.",
-            ),
-            barge_in_offset=meter.create_histogram(
-                semconv.METRIC_BARGE_IN_OFFSET,
-                unit="ms",
-                description=(
-                    "How far into the agent's utterance an interruption landed. "
-                    "Low values suggest VAD misfires; high values suggest verbosity."
-                ),
-            ),
-            audio_input_seconds=meter.create_counter(
-                semconv.METRIC_AUDIO_INPUT_SECONDS,
-                unit="s",
+            audio_input_seconds=m.create_counter(
+                semconv.METRIC_AUDIO_INPUT_SECONDS, unit="s",
                 description="Seconds of user audio streamed to the model.",
             ),
-            audio_output_seconds=meter.create_counter(
-                semconv.METRIC_AUDIO_OUTPUT_SECONDS,
-                unit="s",
+            audio_output_seconds=m.create_counter(
+                semconv.METRIC_AUDIO_OUTPUT_SECONDS, unit="s",
                 description="Seconds of agent audio streamed back.",
             ),
-            video_frames=meter.create_counter(
-                semconv.METRIC_VIDEO_FRAMES,
-                unit="{frame}",
-                description="Video frames forwarded to the model.",
+            stream_gap=m.create_histogram(
+                semconv.METRIC_STREAM_GAP, unit="ms",
+                description=(
+                    "Pauses between consecutive output chunks mid-utterance — "
+                    "stutter, as distinct from a slow start."
+                ),
             ),
-            session_count=meter.create_counter(
-                semconv.METRIC_SESSION_COUNT,
-                unit="{session}",
-                description="Voice sessions opened.",
+            vision_frames=m.create_counter(
+                semconv.METRIC_VISION_FRAMES, unit="{frame}",
+                description="Camera or screen frames forwarded to the model.",
             ),
-            token_usage=meter.create_counter(
-                semconv.METRIC_TOKEN_USAGE,
-                unit="{token}",
+            tool_duration=m.create_histogram(
+                semconv.METRIC_TOOL_DURATION, unit="ms",
+                description="Tool execution latency.",
+            ),
+            tool_retries=m.create_counter(
+                semconv.METRIC_TOOL_RETRIES, unit="{retry}",
+                description="Tool retries within a turn.",
+            ),
+            session_count=m.create_counter(
+                semconv.METRIC_SESSION_COUNT, unit="{session}",
+                description="Realtime sessions opened.",
+            ),
+            token_usage=m.create_counter(
+                semconv.METRIC_TOKEN_USAGE, unit="{token}",
                 description=(
                     "Tokens consumed, split by direction and media modality. "
                     "Audio and video dominate spend in realtime sessions."
@@ -113,26 +178,34 @@ def voice_metrics() -> VoiceMetrics:
 
 
 def reset() -> None:
-    """Drop cached instruments so they rebind to a new meter provider.
-    Used by tests and by ``configure(force=True)``."""
+    """Drop cached instruments so they rebind to a new meter provider."""
     global _metrics
     _metrics = None
 
 
 def base_attributes(
-    session_id: str,
     provider: str,
     model: str | None = None,
+    *,
+    transport: str | None = None,
+    prompt_version: str | None = None,
+    agent_version: str | None = None,
     **extra: Any,
 ) -> dict[str, Any]:
-    """Attribute set shared by every voice instrument.
+    """Dimensions shared by every instrument.
 
-    Deliberately low-cardinality: session id is *not* included, because putting
-    a unique id on a metric attribute is the classic way to melt a time-series
-    backend. Session correlation belongs on spans, where it is free.
+    Prompt and agent version are included on purpose. They are bounded — you
+    deploy tens of versions, not millions — and they are what turns "TTFA got
+    worse" into "TTFA got worse when prompt v17 shipped".
     """
-    attrs: dict[str, Any] = {semconv.VOICE_PROVIDER: provider}
+    attrs: dict[str, Any] = {semconv.PROVIDER: provider}
     if model:
         attrs[semconv.GEN_AI_REQUEST_MODEL] = model
+    if transport:
+        attrs[semconv.TRANSPORT] = transport
+    if prompt_version:
+        attrs[semconv.PROMPT_VERSION] = prompt_version
+    if agent_version:
+        attrs[semconv.AGENT_VERSION] = agent_version
     attrs.update({k: v for k, v in extra.items() if v is not None})
     return attrs

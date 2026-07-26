@@ -1,0 +1,27 @@
+# SigNoz stack for cadence, provisioned by Foundry.
+#
+#   foundryctl cast -f deploy/casting.yaml
+#
+# Brings up the SigNoz backend, the OpenTelemetry collector, and the SigNoz
+# MCP server — the last of which is what lets an AI client (and cadence's own
+# demo agent) query the telemetry it just produced.
+#
+# Ports:
+#   8080  SigNoz UI
+#   4317  OTLP gRPC ingest
+#   4318  OTLP HTTP ingest   <- cadence exports here
+#   8000  SigNoz MCP server
+
+apiVersion: v1alpha1
+kind: Installation
+metadata:
+  name: signoz
+spec:
+  deployment:
+    flavor: compose
+    mode: docker
+
+  # Disabled by default upstream; cadence depends on it, so it is explicit here.
+  mcp:
+    spec:
+      enabled: true

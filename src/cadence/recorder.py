@@ -3,35 +3,46 @@
 This is the part of cadence that does not exist elsewhere.
 
 A request/response instrumentor knows when a span starts (you called the API)
-and when it ends (the reply arrived). On a duplex audio socket neither of those
-moments exists, so the recorder reconstructs conversational structure from the
+and when it ends (the reply arrived). On a duplex stream neither moment
+exists, so the recorder reconstructs conversational structure from the raw
 signal stream:
 
-    voice.conversation                     one connected session
-      +- voice.turn                        one exchange
-      |    +- voice.user_utterance         VAD start -> VAD end
-      |    +- chat                          end of user speech -> generation done
-      |    |    +- execute_tool            tools, including mid-stream ones
-      |    +- voice.agent_utterance        first audio out -> playback done
-      |         (event) voice.barge_in     if the user cut in
-      +- voice.turn ...
+    realtime.session                        one connected session
+      +- realtime.turn                      one exchange
+      |    +- realtime.audio.user_utterance   input start -> input end
+      |    +- chat                          input end -> generation done  [gen_ai.*]
+      |    |    +- execute_tool             tools, including mid-stream
+      |    +- realtime.audio.agent_utterance  first output -> playback done
+      |         (event) realtime.barge_in   if the user cut in
+      +- realtime.turn ...
 
-Three decisions in here are load-bearing:
+Load-bearing decisions
+----------------------
 
-1. **Time to first audio is measured from end-of-user-speech to first outbound
-   audio frame**, not from any model call boundary. That interval is the
-   silence the human actually sat through, which is what determines whether
-   the agent feels alive. It deliberately includes VAD dwell and network time.
+**Time to first audio is measured at the audio boundary, not the model
+boundary.** From the last inbound user frame to the first outbound agent
+frame. That interval deliberately includes VAD dwell, network, queueing and
+time-to-first-token, because all of it is silence to the person waiting.
 
-2. **Barge-in closes the current turn and opens a new one.** An interruption is
-   not an error inside a turn; it is the user taking the floor, which is the
-   definition of a new turn. Modelling it any other way produces turns that
-   nest incoherently once a conversation gets lively.
+**Barge-in ends the current turn and opens a new one.** An interruption is not
+an error inside a turn; it is the user taking the floor, which is what a new
+turn *is*. Any other model nests incoherently once a conversation gets lively.
 
-3. **The agent may speak first.** Proactive greetings and tool-triggered
-   utterances have no preceding user speech, so TTFA is left unset rather than
-   fabricated from the session start. A missing metric is honest; a wrong one
-   poisons the p95.
+**The agent may speak first.** Proactive greetings have no preceding user
+input, so TTFA is omitted rather than fabricated from session start. A missing
+metric is honest; a wrong one poisons the percentile.
+
+**Overlap is tracked separately from barge-in.** Barge-in is the event of
+cutting in; overlap is how long both parties continued at once before the
+agent yielded. They diagnose different faults.
+
+Overhead
+--------
+The hot path is ``handle()``, called once per inbound signal. It performs a
+dict lookup and a handful of float comparisons; no allocation beyond the span
+attributes themselves, no copying of audio, and no I/O. Exceptions are caught
+and swallowed — instrumentation must never take down the agent it is watching.
+See ``tests/test_overhead.py`` for the measured cost.
 """
 
 from __future__ import annotations
@@ -46,6 +57,7 @@ from opentelemetry import trace
 from opentelemetry.trace import Span, SpanKind, Status, StatusCode
 
 from . import semconv
+from .dialogue import DEFAULT_CLASSIFIER, DialogueClassifier
 from .events import EventType, VoiceEvent
 from .metrics import base_attributes, voice_metrics
 from .tracing import get_tracer
@@ -53,8 +65,16 @@ from .tracing import get_tracer
 logger = logging.getLogger(__name__)
 
 EventHook = Callable[[str, dict[str, Any]], None]
-"""Optional callback fired as turns progress, so a UI can render the same
-structure the spans describe without re-deriving it."""
+"""Fired as turns progress so a UI can render the same structure the spans
+describe without re-deriving it."""
+
+
+@dataclass(slots=True)
+class ToolRecord:
+    span: Span
+    name: str
+    started: float
+    retries: int = 0
 
 
 @dataclass(slots=True)
@@ -71,20 +91,28 @@ class TurnState:
     inference_span: Span | None = None
 
     speech_end_monotonic: float | None = None
-    """When the user stopped talking. Start of the TTFA clock."""
+    """When the user stopped. Start of the TTFA clock."""
 
     agent_audio_start_monotonic: float | None = None
-    """When the first byte of agent audio went out. End of the TTFA clock, and
-    the origin against which barge-in offset is measured."""
+    """First byte of agent audio out. End of the TTFA clock, and the origin
+    against which barge-in offset is measured."""
+
+    last_agent_chunk_monotonic: float | None = None
+    max_stream_gap_ms: float = 0.0
 
     ttfa_ms: float | None = None
     interrupted: bool = False
+    generation_complete: bool = False
     tool_call_count: int = 0
+    overlap_ms: float = 0.0
+    silence_ms: float = 0.0
     agent_audio_ms: float = 0.0
     user_audio_ms: float = 0.0
+    repair: str | None = None
+    fallback: str | None = None
     user_transcript: list[str] = field(default_factory=list)
     agent_transcript: list[str] = field(default_factory=list)
-    tool_spans: dict[str, Span] = field(default_factory=dict)
+    tools: dict[str, ToolRecord] = field(default_factory=dict)
     ended: bool = False
 
 
@@ -92,7 +120,7 @@ class ConversationRecorder:
     """Consumes normalized :class:`VoiceEvent`s and emits spans and metrics.
 
     One recorder per session. Not thread-safe by design: a duplex session is
-    driven by a single asyncio task, and adding a lock would buy nothing but
+    driven by a single asyncio task, and a lock would buy nothing but
     contention on the hot audio path.
     """
 
@@ -102,31 +130,53 @@ class ConversationRecorder:
         session_id: str | None = None,
         provider: str = "gemini_live",
         model: str | None = None,
-        transport: str = "websocket",
+        transport: str = semconv.Transport.WEBSOCKET,
+        prompt_version: str | None = None,
+        agent_version: str | None = None,
         capture_content: bool = False,
-        input_sample_rate: int = 16_000,
-        output_sample_rate: int = 24_000,
+        classifier: DialogueClassifier | None = None,
         on_event: EventHook | None = None,
     ) -> None:
         self.session_id = session_id or uuid.uuid4().hex[:16]
         self.provider = provider
         self.model = model
         self.transport = transport
+        self.prompt_version = prompt_version
+        self.agent_version = agent_version
         self.capture_content = capture_content
-        self.input_sample_rate = input_sample_rate
-        self.output_sample_rate = output_sample_rate
+        self.classifier = classifier or DEFAULT_CLASSIFIER
         self.on_event = on_event
 
         self._tracer = get_tracer()
         self._metrics = voice_metrics()
-        self._attrs = base_attributes(self.session_id, provider, model)
+        self._attrs = base_attributes(
+            provider,
+            model,
+            transport=transport,
+            prompt_version=prompt_version,
+            agent_version=agent_version,
+        )
 
-        self._conversation_span: Span | None = None
-        self._conversation_ctx = None
+        self._session_span: Span | None = None
+        self._session_ctx = None
+        self._session_start: float | None = None
         self._turn: TurnState | None = None
         self._turn_index = 0
+
+        # session-scoped tallies
         self._completed_turns = 0
         self._barge_ins = 0
+        self._repairs = 0
+        self._fallbacks = 0
+        self._handoff = False
+        self._silence_ms = 0.0
+
+        # duplex activity state, from which overlap and silence are derived
+        self._user_active = False
+        self._agent_active = False
+        self._overlap_start: float | None = None
+        self._quiet_since: float | None = None
+
         self._closed = False
 
     # ------------------------------------------------------------------
@@ -134,24 +184,45 @@ class ConversationRecorder:
     # ------------------------------------------------------------------
 
     def start(self) -> None:
-        if self._conversation_span is not None:
+        if self._session_span is not None:
             return
-        self._conversation_span = self._tracer.start_span(
-            semconv.SPAN_CONVERSATION,
-            kind=SpanKind.SERVER,
-            attributes={
-                semconv.VOICE_SESSION_ID: self.session_id,
-                semconv.VOICE_PROVIDER: self.provider,
-                semconv.VOICE_TRANSPORT: self.transport,
-                semconv.GEN_AI_CONVERSATION_ID: self.session_id,
-                **({semconv.GEN_AI_REQUEST_MODEL: self.model} if self.model else {}),
-            },
+        now = time.monotonic()
+        self._session_start = now
+        self._quiet_since = now
+
+        attributes: dict[str, Any] = {
+            semconv.SESSION_ID: self.session_id,
+            semconv.PROVIDER: self.provider,
+            semconv.TRANSPORT: self.transport,
+            semconv.ATTR_SCHEMA_VERSION: semconv.SCHEMA_VERSION,
+            semconv.GEN_AI_CONVERSATION_ID: self.session_id,
+        }
+        if self.model:
+            attributes[semconv.GEN_AI_REQUEST_MODEL] = self.model
+        if self.prompt_version:
+            attributes[semconv.PROMPT_VERSION] = self.prompt_version
+        if self.agent_version:
+            attributes[semconv.AGENT_VERSION] = self.agent_version
+
+        self._session_span = self._tracer.start_span(
+            semconv.SPAN_SESSION, kind=SpanKind.SERVER, attributes=attributes
         )
-        self._conversation_ctx = trace.set_span_in_context(self._conversation_span)
+        self._session_ctx = trace.set_span_in_context(self._session_span)
         self._metrics.session_count.add(1, self._attrs)
         self._emit("session_open", {"session_id": self.session_id})
 
-    def close(self, error: BaseException | None = None) -> None:
+    def close(
+        self,
+        error: BaseException | None = None,
+        outcome: str | None = None,
+    ) -> None:
+        """End the session.
+
+        ``outcome`` may be supplied by the application when it knows better;
+        otherwise it is inferred. A session that escalated to a human is
+        `transferred`; one that produced no completed turns at all is
+        `abandoned`; anything else is `contained`.
+        """
         if self._closed:
             return
         self._closed = True
@@ -159,19 +230,51 @@ class ConversationRecorder:
         if self._turn is not None and not self._turn.ended:
             self._end_turn(semconv.EndReason.SESSION_CLOSED)
 
-        if self._conversation_span is not None:
-            self._conversation_span.set_attribute(
-                semconv.VOICE_SESSION_TURN_COUNT, self._completed_turns
+        now = time.monotonic()
+        self._accumulate_silence(now)
+
+        if outcome is None:
+            if self._handoff:
+                outcome = semconv.Outcome.TRANSFERRED
+            elif self._completed_turns == 0:
+                outcome = semconv.Outcome.ABANDONED
+            else:
+                outcome = semconv.Outcome.CONTAINED
+
+        duration_ms = (now - (self._session_start or now)) * 1000.0
+        silence_ratio = (
+            round(self._silence_ms / duration_ms, 4) if duration_ms > 0 else 0.0
+        )
+
+        if self._session_span is not None:
+            span = self._session_span
+            span.set_attribute(semconv.SESSION_TURN_COUNT, self._completed_turns)
+            span.set_attribute(semconv.SESSION_DURATION_MS, round(duration_ms, 2))
+            span.set_attribute(semconv.SESSION_SILENCE_SECONDS, round(self._silence_ms / 1000, 3))
+            span.set_attribute(semconv.SESSION_SILENCE_RATIO, silence_ratio)
+            span.set_attribute(semconv.SESSION_OUTCOME, outcome)
+            span.set_attribute(
+                semconv.SESSION_CONTAINED, outcome == semconv.Outcome.CONTAINED
             )
             if error is not None:
-                self._conversation_span.record_exception(error)
-                self._conversation_span.set_status(Status(StatusCode.ERROR, str(error)))
-            self._conversation_span.end()
+                span.record_exception(error)
+                span.set_status(Status(StatusCode.ERROR, str(error)))
+            span.end()
+
+        self._metrics.outcome_count.add(1, {**self._attrs, semconv.SESSION_OUTCOME: outcome})
+        self._metrics.silence_seconds.add(self._silence_ms / 1000.0, self._attrs)
 
         self._emit(
             "session_close",
-            {"session_id": self.session_id, "turns": self._completed_turns,
-             "barge_ins": self._barge_ins},
+            {
+                "session_id": self.session_id,
+                "turns": self._completed_turns,
+                "barge_ins": self._barge_ins,
+                "repairs": self._repairs,
+                "fallbacks": self._fallbacks,
+                "outcome": outcome,
+                "silence_ratio": silence_ratio,
+            },
         )
 
     # ------------------------------------------------------------------
@@ -180,9 +283,8 @@ class ConversationRecorder:
 
     def handle(self, event: VoiceEvent) -> None:
         """Feed one normalized event through the state machine."""
-        if self._conversation_span is None:
+        if self._session_span is None:
             self.start()
-
         try:
             handler = self._HANDLERS.get(event.type)
             if handler is not None:
@@ -191,13 +293,17 @@ class ConversationRecorder:
             # Instrumentation must never take down the agent it is watching.
             logger.exception("cadence: error handling %s", event.type)
 
-    # -- inbound: the human --------------------------------------------
+    # -- inbound -------------------------------------------------------
 
     def _on_user_speech_start(self, event: VoiceEvent) -> None:
+        self._accumulate_silence(event.monotonic)
+        self._user_active = True
+        self._maybe_start_overlap(event.monotonic)
+
         # The user talking over the agent is a barge-in *and* the start of the
         # next turn. Record the interruption against the utterance it cut off,
         # then hand the floor over.
-        if self._turn is not None and self._is_agent_speaking(self._turn):
+        if self._turn is not None and self._agent_active:
             self._record_barge_in(self._turn, event)
             self._end_turn(semconv.EndReason.INTERRUPTED)
 
@@ -211,47 +317,52 @@ class ConversationRecorder:
                 semconv.SPAN_USER_UTTERANCE,
                 context=trace.set_span_in_context(turn.span),
                 attributes={
-                    semconv.VOICE_UTTERANCE_ROLE: semconv.Role.USER,
-                    semconv.VOICE_SESSION_ID: self.session_id,
-                    semconv.VOICE_TURN_ID: turn.turn_id,
+                    semconv.AUDIO_UTTERANCE_ROLE: semconv.Role.USER,
+                    semconv.SESSION_ID: self.session_id,
+                    semconv.TURN_ID: turn.turn_id,
                 },
             )
         self._emit("user_speech_start", {"turn": turn.index})
 
     def _on_user_speech_end(self, event: VoiceEvent) -> None:
+        self._user_active = False
+        self._close_overlap(event.monotonic)
+        self._mark_quiet(event.monotonic)
+
         turn = self._turn
         if turn is None or turn.ended:
             return
-        # Start of the TTFA clock.
-        turn.speech_end_monotonic = event.monotonic
+        turn.speech_end_monotonic = event.monotonic  # TTFA clock starts
+
         if turn.user_utterance_span is not None:
             span = turn.user_utterance_span
             span.set_attribute(
-                semconv.VOICE_UTTERANCE_DURATION_MS,
+                semconv.AUDIO_UTTERANCE_DURATION_MS,
                 round((event.monotonic - turn.started_monotonic) * 1000, 2),
             )
-            span.set_attribute(semconv.VOICE_UTTERANCE_AUDIO_MS, round(turn.user_audio_ms, 2))
+            span.set_attribute(semconv.AUDIO_UTTERANCE_AUDIO_MS, round(turn.user_audio_ms, 2))
             if self.capture_content and turn.user_transcript:
                 span.set_attribute(
-                    semconv.VOICE_UTTERANCE_TRANSCRIPT, " ".join(turn.user_transcript)
+                    semconv.AUDIO_UTTERANCE_TRANSCRIPT, " ".join(turn.user_transcript)
                 )
             span.end()
             turn.user_utterance_span = None
 
-        # The model is now thinking. This is the only part of a realtime turn
-        # that maps cleanly onto the existing GenAI convention, so it gets a
-        # standard `chat` span with standard attributes.
+        # The only part of a realtime turn that maps cleanly onto the existing
+        # GenAI convention gets a standard `chat` span.
+        attributes = {
+            semconv.GEN_AI_OPERATION_NAME: "chat",
+            semconv.GEN_AI_PROVIDER_NAME: self.provider,
+            semconv.GEN_AI_CONVERSATION_ID: self.session_id,
+            semconv.TURN_ID: turn.turn_id,
+        }
+        if self.model:
+            attributes[semconv.GEN_AI_REQUEST_MODEL] = self.model
         turn.inference_span = self._tracer.start_span(
             semconv.SPAN_CHAT,
             kind=SpanKind.CLIENT,
             context=trace.set_span_in_context(turn.span),
-            attributes={
-                semconv.GEN_AI_OPERATION_NAME: "chat",
-                semconv.GEN_AI_PROVIDER_NAME: self.provider,
-                semconv.GEN_AI_CONVERSATION_ID: self.session_id,
-                semconv.VOICE_TURN_ID: turn.turn_id,
-                **({semconv.GEN_AI_REQUEST_MODEL: self.model} if self.model else {}),
-            },
+            attributes=attributes,
         )
         self._emit("user_speech_end", {"turn": turn.index})
 
@@ -264,14 +375,27 @@ class ConversationRecorder:
         self._metrics.audio_input_seconds.add(seconds, self._attrs)
 
     def _on_video_frame_sent(self, event: VoiceEvent) -> None:
-        self._metrics.video_frames.add(1, self._attrs)
+        attrs = self._attrs
+        if event.payload.get("source"):
+            attrs = {**attrs, semconv.VISION_SOURCE: event.payload["source"]}
+        self._metrics.vision_frames.add(1, attrs)
 
     def _on_user_transcript(self, event: VoiceEvent) -> None:
-        if self._turn is not None and event.text:
-            self._turn.user_transcript.append(event.text)
+        turn = self._turn
+        if turn is not None and event.text:
+            turn.user_transcript.append(event.text)
+
+            # Repair detection runs here, in-process. Only the resulting
+            # classification is exported -- the transcript text itself never
+            # leaves unless content capture is explicitly enabled.
+            if turn.repair is None:
+                repair = self.classifier.classify_user(event.text)
+                if repair:
+                    self._record_repair(turn, repair)
+
         self._emit("user_transcript", {"text": event.text, "final": event.payload.get("final")})
 
-    # -- outbound: the agent -------------------------------------------
+    # -- outbound ------------------------------------------------------
 
     def _on_agent_audio_chunk(self, event: VoiceEvent) -> None:
         # An agent that speaks unprompted still owns a turn.
@@ -280,53 +404,79 @@ class ConversationRecorder:
         turn = self._turn
         assert turn is not None
 
+        self._accumulate_silence(event.monotonic)
+        was_active = self._agent_active
+        self._agent_active = True
+        if not was_active:
+            self._maybe_start_overlap(event.monotonic)
+
         if turn.agent_audio_start_monotonic is None:
             turn.agent_audio_start_monotonic = event.monotonic
             turn.agent_utterance_span = self._tracer.start_span(
                 semconv.SPAN_AGENT_UTTERANCE,
                 context=trace.set_span_in_context(turn.span),
                 attributes={
-                    semconv.VOICE_UTTERANCE_ROLE: semconv.Role.AGENT,
-                    semconv.VOICE_SESSION_ID: self.session_id,
-                    semconv.VOICE_TURN_ID: turn.turn_id,
+                    semconv.AUDIO_UTTERANCE_ROLE: semconv.Role.AGENT,
+                    semconv.SESSION_ID: self.session_id,
+                    semconv.TURN_ID: turn.turn_id,
                 },
             )
-            # Close the TTFA clock, but only if there was a user utterance to
+            # Close the TTFA clock -- but only when there was user input to
             # measure from. Agent-initiated turns have no meaningful TTFA.
             if turn.speech_end_monotonic is not None:
                 ttfa = (event.monotonic - turn.speech_end_monotonic) * 1000.0
                 turn.ttfa_ms = round(ttfa, 2)
-                turn.span.set_attribute(semconv.VOICE_TURN_TTFA_MS, turn.ttfa_ms)
+                turn.span.set_attribute(semconv.TURN_TTFA_MS, turn.ttfa_ms)
+                turn.span.set_attribute(semconv.TURN_TTFR_MS, turn.ttfa_ms)
                 self._metrics.ttfa.record(ttfa, self._attrs)
+                self._metrics.ttfr.record(ttfa, self._attrs)
                 self._emit("ttfa", {"turn": turn.index, "ttfa_ms": turn.ttfa_ms})
+        else:
+            # Stutter detection: a long pause between chunks mid-utterance is
+            # a different fault from a slow start, and sounds worse.
+            if turn.last_agent_chunk_monotonic is not None:
+                gap_ms = (event.monotonic - turn.last_agent_chunk_monotonic) * 1000.0
+                # Anything under a chunk's own duration is just pacing.
+                if gap_ms > max(120.0, (event.audio_ms or 0.0) * 1.5):
+                    turn.max_stream_gap_ms = max(turn.max_stream_gap_ms, gap_ms)
+                    self._metrics.stream_gap.record(gap_ms, self._attrs)
 
+        turn.last_agent_chunk_monotonic = event.monotonic
         turn.agent_audio_ms += event.audio_ms or 0.0
         if event.audio_ms:
             self._metrics.audio_output_seconds.add(event.audio_ms / 1000.0, self._attrs)
 
     def _on_agent_transcript(self, event: VoiceEvent) -> None:
-        if self._turn is not None and event.text:
-            self._turn.agent_transcript.append(event.text)
+        turn = self._turn
+        if turn is not None and event.text:
+            turn.agent_transcript.append(event.text)
+            if turn.fallback is None:
+                fallback = self.classifier.classify_agent(event.text)
+                if fallback:
+                    self._record_fallback(turn, fallback)
         self._emit("agent_transcript", {"text": event.text})
 
     def _on_generation_complete(self, event: VoiceEvent) -> None:
         turn = self._turn
-        if turn is None or turn.inference_span is None:
+        if turn is None:
             return
-        turn.inference_span.set_attribute(
-            semconv.GEN_AI_RESPONSE_FINISH_REASONS, ["stop"]
-        )
-        turn.inference_span.end()
-        turn.inference_span = None
+        turn.generation_complete = True
+        if turn.inference_span is not None:
+            turn.inference_span.set_attribute(
+                semconv.GEN_AI_RESPONSE_FINISH_REASONS, ["stop"]
+            )
+            turn.inference_span.end()
+            turn.inference_span = None
 
-    # -- turn control ---------------------------------------------------
+    # -- turn control --------------------------------------------------
 
     def _on_interrupted(self, event: VoiceEvent) -> None:
         """Provider-reported interruption.
 
-        Gemini reports this after its own VAD decides the user has taken the
-        floor. We may already have recorded the barge-in locally from inbound
-        audio, in which case this is a confirmation and must not double count.
+        Providers report this after their own detection decides the user has
+        taken the floor. We may already have recorded the barge-in locally, in
+        which case this is a confirmation and must not double count -- or every
+        barge-in dashboard reads double.
         """
         turn = self._turn
         if turn is None or turn.ended:
@@ -338,8 +488,13 @@ class ConversationRecorder:
     def _on_turn_complete(self, event: VoiceEvent) -> None:
         if self._turn is None or self._turn.ended:
             return
-        reason = event.reason or semconv.EndReason.COMPLETED
-        self._end_turn(reason)
+        self._end_turn(event.reason or semconv.EndReason.COMPLETED)
+
+    def _on_playback_finished(self, event: VoiceEvent) -> None:
+        """Agent audio finished playing. Ends overlap and starts dead air."""
+        self._agent_active = False
+        self._close_overlap(event.monotonic)
+        self._mark_quiet(event.monotonic)
 
     # -- tools -----------------------------------------------------------
 
@@ -348,6 +503,15 @@ class ConversationRecorder:
         if turn is None or turn.ended:
             return
         turn.tool_call_count += 1
+        name = event.name or "unknown"
+        key = event.call_id or f"{name}:{turn.tool_call_count}"
+
+        # A repeat call to the same tool inside one turn is a retry.
+        existing = next((r for r in turn.tools.values() if r.name == name), None)
+        retries = existing.retries + 1 if existing else 0
+        if retries:
+            self._metrics.tool_retries.add(1, {**self._attrs, semconv.TOOL_NAME: name})
+
         parent = turn.inference_span or turn.span
         span = self._tracer.start_span(
             semconv.SPAN_EXECUTE_TOOL,
@@ -355,61 +519,67 @@ class ConversationRecorder:
             context=trace.set_span_in_context(parent),
             attributes={
                 semconv.GEN_AI_OPERATION_NAME: "execute_tool",
-                semconv.GEN_AI_TOOL_NAME: event.name or "unknown",
-                semconv.VOICE_TURN_ID: turn.turn_id,
-                semconv.VOICE_SESSION_ID: self.session_id,
-                # Tools firing while audio is still playing are a realtime-only
-                # phenomenon and a common source of confusing latency.
-                "voice.tool.mid_stream": self._is_agent_speaking(turn),
+                semconv.GEN_AI_TOOL_NAME: name,
+                semconv.TOOL_NAME: name,
+                semconv.TURN_ID: turn.turn_id,
+                semconv.SESSION_ID: self.session_id,
+                semconv.TOOL_MID_STREAM: self._agent_active,
+                semconv.TOOL_RETRY_COUNT: retries,
             },
         )
-        key = event.call_id or f"{event.name}:{turn.tool_call_count}"
-        turn.tool_spans[key] = span
-        self._emit("tool_call", {"name": event.name, "turn": turn.index})
+        turn.tools[key] = ToolRecord(span=span, name=name, started=event.monotonic, retries=retries)
+        self._emit("tool_call", {"name": name, "turn": turn.index})
 
     def _on_tool_result(self, event: VoiceEvent) -> None:
         turn = self._turn
         if turn is None:
             return
         key = event.call_id or ""
-        span = turn.tool_spans.pop(key, None)
-        if span is None and turn.tool_spans:
-            # Providers do not always echo the call id; fall back to FIFO so a
-            # missing id degrades into slightly fuzzy timing rather than a leak.
-            key, span = turn.tool_spans.popitem()
-        if span is None:
+        record = turn.tools.pop(key, None)
+        if record is None and turn.tools:
+            # Providers do not always echo the call id; FIFO degrades into
+            # slightly fuzzy timing rather than a leaked span.
+            key, record = turn.tools.popitem()
+        if record is None:
             return
-        if event.payload.get("error"):
-            span.set_status(Status(StatusCode.ERROR, str(event.payload["error"])))
-        span.end()
-        self._emit("tool_result", {"name": event.name, "turn": turn.index})
+
+        duration_ms = (event.monotonic - record.started) * 1000.0
+        record.span.set_attribute(semconv.TOOL_DURATION_MS, round(duration_ms, 2))
+        record.span.set_attribute(semconv.TOOL_INTERRUPTED, False)
+        error = event.payload.get("error")
+        if error:
+            record.span.set_attribute(semconv.TOOL_ERROR, str(error))
+            record.span.set_status(Status(StatusCode.ERROR, str(error)))
+        record.span.end()
+
+        self._metrics.tool_duration.record(
+            duration_ms, {**self._attrs, semconv.TOOL_NAME: record.name}
+        )
+        self._emit("tool_result", {"name": record.name, "turn": turn.index})
 
     # -- accounting ------------------------------------------------------
 
     def _on_usage(self, event: VoiceEvent) -> None:
-        """Record token spend, split by direction and media modality.
+        """Token spend, split by direction and media modality.
 
-        The modality split is the point. A realtime session's bill is dominated
-        by audio and video tokens, and an aggregate total hides which one is
-        running away from you.
+        The split is the point: a realtime session's bill is dominated by audio
+        and video, and an aggregate total hides which one is running away.
         """
         turn = self._turn
-        target = turn.inference_span if turn and turn.inference_span else self._conversation_span
+        target = turn.inference_span if turn and turn.inference_span else self._session_span
 
         for direction, total_key, details_key in (
             ("input", "prompt_token_count", "prompt_tokens_details"),
             ("output", "response_token_count", "response_tokens_details"),
         ):
             total = event.payload.get(total_key)
-            if total:
-                if target is not None:
-                    attr = (
-                        semconv.GEN_AI_USAGE_INPUT_TOKENS
-                        if direction == "input"
-                        else semconv.GEN_AI_USAGE_OUTPUT_TOKENS
-                    )
-                    target.set_attribute(attr, int(total))
-
+            if total and target is not None:
+                target.set_attribute(
+                    semconv.GEN_AI_USAGE_INPUT_TOKENS
+                    if direction == "input"
+                    else semconv.GEN_AI_USAGE_OUTPUT_TOKENS,
+                    int(total),
+                )
             for entry in event.payload.get(details_key) or []:
                 modality = (entry.get("modality") or "unspecified").lower()
                 count = entry.get("token_count") or 0
@@ -419,14 +589,17 @@ class ConversationRecorder:
                         {
                             **self._attrs,
                             semconv.GEN_AI_TOKEN_TYPE: direction,
-                            "gen_ai.token.modality": modality,
+                            semconv.GEN_AI_TOKEN_MODALITY: modality,
                         },
                     )
         self._emit("usage", dict(event.payload))
 
     def _on_error(self, event: VoiceEvent) -> None:
-        span = (self._turn.span if self._turn and not self._turn.ended
-                else self._conversation_span)
+        span = (
+            self._turn.span
+            if self._turn and not self._turn.ended
+            else self._session_span
+        )
         if span is not None:
             span.set_status(Status(StatusCode.ERROR, event.text or "error"))
 
@@ -438,27 +611,32 @@ class ConversationRecorder:
         index = self._turn_index
         self._turn_index += 1
         turn_id = f"{self.session_id}-{index}"
+
+        attributes: dict[str, Any] = {
+            semconv.TURN_ID: turn_id,
+            semconv.TURN_INDEX: index,
+            semconv.SESSION_ID: self.session_id,
+            semconv.PROVIDER: self.provider,
+            semconv.TURN_AGENT_INITIATED: agent_initiated,
+        }
+        if self.model:
+            attributes[semconv.GEN_AI_REQUEST_MODEL] = self.model
+        if self.prompt_version:
+            attributes[semconv.PROMPT_VERSION] = self.prompt_version
+
         span = self._tracer.start_span(
             semconv.SPAN_TURN,
             kind=SpanKind.SERVER,
-            context=self._conversation_ctx,
-            attributes={
-                semconv.VOICE_TURN_ID: turn_id,
-                semconv.VOICE_TURN_INDEX: index,
-                semconv.VOICE_SESSION_ID: self.session_id,
-                semconv.VOICE_PROVIDER: self.provider,
-                "voice.turn.agent_initiated": agent_initiated,
-                **({semconv.GEN_AI_REQUEST_MODEL: self.model} if self.model else {}),
-            },
+            context=self._session_ctx,
+            attributes=attributes,
         )
         self._turn = TurnState(
-            index=index,
-            turn_id=turn_id,
-            span=span,
-            started_monotonic=event.monotonic,
+            index=index, turn_id=turn_id, span=span, started_monotonic=event.monotonic
         )
-        self._emit("turn_start", {"turn": index, "turn_id": turn_id,
-                                  "agent_initiated": agent_initiated})
+        self._emit(
+            "turn_start",
+            {"turn": index, "turn_id": turn_id, "agent_initiated": agent_initiated},
+        )
 
     def _end_turn(self, reason: str) -> None:
         turn = self._turn
@@ -469,46 +647,65 @@ class ConversationRecorder:
         duration_ms = (now - turn.started_monotonic) * 1000.0
 
         # Close anything still open, innermost first.
-        for key, span in list(turn.tool_spans.items()):
-            span.set_status(Status(StatusCode.ERROR, "tool did not return before turn end"))
-            span.end()
-        turn.tool_spans.clear()
+        for record in list(turn.tools.values()):
+            record.span.set_attribute(semconv.TOOL_INTERRUPTED, True)
+            record.span.set_attribute(
+                semconv.TOOL_DURATION_MS, round((now - record.started) * 1000, 2)
+            )
+            record.span.set_status(
+                Status(StatusCode.ERROR, "tool did not return before turn end")
+            )
+            record.span.end()
+        turn.tools.clear()
 
         if turn.user_utterance_span is not None:
             turn.user_utterance_span.end()
             turn.user_utterance_span = None
 
+        cancelled = turn.inference_span is not None and not turn.generation_complete
         if turn.inference_span is not None:
             turn.inference_span.end()
             turn.inference_span = None
 
         if turn.agent_utterance_span is not None:
             span = turn.agent_utterance_span
-            span.set_attribute(semconv.VOICE_UTTERANCE_AUDIO_MS, round(turn.agent_audio_ms, 2))
+            span.set_attribute(semconv.AUDIO_UTTERANCE_AUDIO_MS, round(turn.agent_audio_ms, 2))
             span.set_attribute(
-                semconv.VOICE_UTTERANCE_DURATION_MS,
+                semconv.AUDIO_UTTERANCE_DURATION_MS,
                 round((now - (turn.agent_audio_start_monotonic or now)) * 1000, 2),
             )
-            span.set_attribute(semconv.VOICE_UTTERANCE_TRUNCATED, turn.interrupted)
+            span.set_attribute(semconv.AUDIO_UTTERANCE_TRUNCATED, turn.interrupted)
+            if turn.max_stream_gap_ms:
+                span.set_attribute(
+                    semconv.AUDIO_STREAM_GAP_MS, round(turn.max_stream_gap_ms, 2)
+                )
             if self.capture_content and turn.agent_transcript:
                 span.set_attribute(
-                    semconv.VOICE_UTTERANCE_TRANSCRIPT, " ".join(turn.agent_transcript)
+                    semconv.AUDIO_UTTERANCE_TRANSCRIPT, " ".join(turn.agent_transcript)
                 )
             span.end()
             turn.agent_utterance_span = None
 
-        turn.span.set_attribute(semconv.VOICE_TURN_END_REASON, reason)
-        turn.span.set_attribute(semconv.VOICE_TURN_INTERRUPTED, turn.interrupted)
-        turn.span.set_attribute(semconv.VOICE_TURN_TOOL_CALL_COUNT, turn.tool_call_count)
-        turn.span.set_attribute(
-            semconv.VOICE_AUDIO_OUTPUT_SECONDS, round(turn.agent_audio_ms / 1000.0, 3)
+        span = turn.span
+        span.set_attribute(semconv.TURN_END_REASON, reason)
+        span.set_attribute(semconv.TURN_INTERRUPTED, turn.interrupted)
+        span.set_attribute(semconv.TURN_TOOL_CALL_COUNT, turn.tool_call_count)
+        span.set_attribute(semconv.TURN_DURATION_MS, round(duration_ms, 2))
+        span.set_attribute(semconv.TURN_OVERLAP_MS, round(turn.overlap_ms, 2))
+        span.set_attribute(semconv.GENERATION_CANCELLED, cancelled)
+        span.set_attribute(
+            semconv.AUDIO_OUTPUT_SECONDS, round(turn.agent_audio_ms / 1000.0, 3)
         )
-        turn.span.set_attribute(
-            semconv.VOICE_AUDIO_INPUT_SECONDS, round(turn.user_audio_ms / 1000.0, 3)
+        span.set_attribute(
+            semconv.AUDIO_INPUT_SECONDS, round(turn.user_audio_ms / 1000.0, 3)
         )
-        turn.span.end()
+        if turn.max_stream_gap_ms:
+            span.set_attribute(
+                semconv.TURN_MAX_STREAM_GAP_MS, round(turn.max_stream_gap_ms, 2)
+            )
+        span.end()
 
-        metric_attrs = {**self._attrs, semconv.VOICE_TURN_END_REASON: reason}
+        metric_attrs = {**self._attrs, semconv.TURN_END_REASON: reason}
         self._metrics.turn_duration.record(duration_ms, metric_attrs)
         self._metrics.turn_count.add(1, metric_attrs)
         self._completed_turns += 1
@@ -522,7 +719,11 @@ class ConversationRecorder:
                 "ttfa_ms": turn.ttfa_ms,
                 "duration_ms": round(duration_ms, 2),
                 "agent_audio_ms": round(turn.agent_audio_ms, 2),
+                "overlap_ms": round(turn.overlap_ms, 2),
                 "tool_calls": turn.tool_call_count,
+                "repair": turn.repair,
+                "fallback": turn.fallback,
+                "max_stream_gap_ms": round(turn.max_stream_gap_ms, 2) or None,
             },
         )
 
@@ -535,15 +736,14 @@ class ConversationRecorder:
         """Attach the interruption to the utterance it cut off.
 
         Recorded as a span event rather than a separate span so it lands at the
-        exact point in the waterfall where the user cut in -- which is what
-        makes the trace legible at a glance.
+        exact point in the waterfall where the user cut in, which is what makes
+        the trace legible at a glance.
         """
         if turn.interrupted:
             return
         turn.interrupted = True
         self._barge_ins += 1
 
-        # Prefer the provider's own offset; fall back to local timing.
         if event.server_offset_ms is not None:
             offset_ms = event.server_offset_ms
         elif turn.agent_audio_start_monotonic is not None:
@@ -552,22 +752,77 @@ class ConversationRecorder:
             offset_ms = 0.0
         offset_ms = max(0.0, round(offset_ms, 2))
 
-        attributes = {
-            semconv.VOICE_BARGE_IN_OFFSET_MS: offset_ms,
-            semconv.VOICE_BARGE_IN_SOURCE: source,
-            semconv.VOICE_TURN_ID: turn.turn_id,
-        }
         target = turn.agent_utterance_span or turn.span
-        target.add_event(semconv.EVENT_BARGE_IN, attributes=attributes)
-        turn.span.set_attribute(semconv.VOICE_BARGE_IN_OFFSET_MS, offset_ms)
+        target.add_event(
+            semconv.EVENT_BARGE_IN,
+            attributes={
+                semconv.TURN_BARGE_IN_OFFSET_MS: offset_ms,
+                semconv.BARGE_IN_SOURCE: source,
+                semconv.TURN_ID: turn.turn_id,
+            },
+        )
+        turn.span.set_attribute(semconv.TURN_BARGE_IN_OFFSET_MS, offset_ms)
 
-        self._metrics.barge_in_count.add(1, {**self._attrs, semconv.VOICE_BARGE_IN_SOURCE: source})
+        self._metrics.barge_in_count.add(1, {**self._attrs, semconv.BARGE_IN_SOURCE: source})
         self._metrics.barge_in_offset.record(offset_ms, self._attrs)
         self._emit("barge_in", {"turn": turn.index, "offset_ms": offset_ms, "source": source})
 
-    @staticmethod
-    def _is_agent_speaking(turn: TurnState) -> bool:
-        return turn.agent_utterance_span is not None
+    def _record_repair(self, turn: TurnState, repair_type: str) -> None:
+        turn.repair = repair_type
+        self._repairs += 1
+        turn.span.set_attribute(semconv.TURN_REPAIR, True)
+        turn.span.add_event(
+            semconv.EVENT_REPAIR, attributes={semconv.REPAIR_TYPE: repair_type}
+        )
+        self._metrics.repair_count.add(1, {**self._attrs, semconv.REPAIR_TYPE: repair_type})
+        self._emit("repair", {"turn": turn.index, "type": repair_type})
+
+    def _record_fallback(self, turn: TurnState, reason: str) -> None:
+        turn.fallback = reason
+        self._fallbacks += 1
+        turn.span.set_attribute(semconv.TURN_FALLBACK, True)
+        turn.span.add_event(
+            semconv.EVENT_FALLBACK, attributes={semconv.FALLBACK_REASON: reason}
+        )
+        self._metrics.fallback_count.add(1, {**self._attrs, semconv.FALLBACK_REASON: reason})
+
+        if reason == semconv.FallbackReason.HANDOFF:
+            self._handoff = True
+            turn.span.add_event(
+                semconv.EVENT_HANDOFF, attributes={semconv.HANDOFF_REASON: reason}
+            )
+            self._metrics.handoff_count.add(1, self._attrs)
+
+        self._emit("fallback", {"turn": turn.index, "reason": reason})
+
+    # -- overlap and silence -------------------------------------------
+
+    def _maybe_start_overlap(self, now: float) -> None:
+        if self._user_active and self._agent_active and self._overlap_start is None:
+            self._overlap_start = now
+
+    def _close_overlap(self, now: float) -> None:
+        if self._overlap_start is None:
+            return
+        overlap_ms = (now - self._overlap_start) * 1000.0
+        self._overlap_start = None
+        if overlap_ms <= 0:
+            return
+        if self._turn is not None:
+            self._turn.overlap_ms += overlap_ms
+        self._metrics.overlap_duration.record(overlap_ms, self._attrs)
+        self._emit("overlap", {"duration_ms": round(overlap_ms, 2)})
+
+    def _mark_quiet(self, now: float) -> None:
+        """Both parties inactive: dead air starts here."""
+        if not self._user_active and not self._agent_active and self._quiet_since is None:
+            self._quiet_since = now
+
+    def _accumulate_silence(self, now: float) -> None:
+        if self._quiet_since is None:
+            return
+        self._silence_ms += max(0.0, (now - self._quiet_since) * 1000.0)
+        self._quiet_since = None
 
     def _emit(self, kind: str, data: dict[str, Any]) -> None:
         if self.on_event is None:
@@ -577,12 +832,14 @@ class ConversationRecorder:
         except Exception:
             logger.debug("cadence: on_event hook raised", exc_info=True)
 
+    # ------------------------------------------------------------------
+
     @property
     def trace_id(self) -> str | None:
-        """Hex trace id of the conversation, for deep-linking into SigNoz."""
-        if self._conversation_span is None:
+        """Hex trace id of the session, for deep-linking into a backend."""
+        if self._session_span is None:
             return None
-        ctx = self._conversation_span.get_span_context()
+        ctx = self._session_span.get_span_context()
         return format(ctx.trace_id, "032x") if ctx.trace_id else None
 
     @property
@@ -591,6 +848,9 @@ class ConversationRecorder:
             "session_id": self.session_id,
             "turns": self._completed_turns,
             "barge_ins": self._barge_ins,
+            "repairs": self._repairs,
+            "fallbacks": self._fallbacks,
+            "handoff": self._handoff,
             "trace_id": self.trace_id,
         }
 
@@ -606,6 +866,7 @@ ConversationRecorder._HANDLERS = {
     EventType.AGENT_AUDIO_CHUNK: ConversationRecorder._on_agent_audio_chunk,
     EventType.AGENT_TRANSCRIPT: ConversationRecorder._on_agent_transcript,
     EventType.AGENT_GENERATION_COMPLETE: ConversationRecorder._on_generation_complete,
+    EventType.PLAYBACK_FINISHED: ConversationRecorder._on_playback_finished,
     EventType.INTERRUPTED: ConversationRecorder._on_interrupted,
     EventType.TURN_COMPLETE: ConversationRecorder._on_turn_complete,
     EventType.TOOL_CALL: ConversationRecorder._on_tool_call,
