@@ -123,62 +123,65 @@ confident wrong attribution is worse than none, because people act on it.
 
 ## Verified against a live SigNoz
 
-Not a claim — this was run end to end, and every failure along the way is
-documented in the commit history:
+Not a claim — run end to end, with every failure along the way in the commit
+history.
 
 | Signal | Verified |
 |---|---|
-| Spans ingested | **16,596** across ~1,600 simulated conversations |
-| Metric series | **45** distinct `realtime.*` series |
-| Trace shape | `realtime.session` → `realtime.turn` → utterances → `chat` → `execute_tool`, 46 spans in a 1.35-minute session |
-| TTFA p95 | **487ms** on prompt v16, **720ms** on v17 — against a 350ms objective |
+| Spans | **3,876** across **144 sessions** |
+| Real Gemini Live | **77 turns**, **44 tool calls**, all 9 adapter events verified against real `LiveServerMessage`s |
 | Dashboards | 2, provisioned over the API, populated, targets drawn |
 | Alerts | 3 rules live, provisioned **through the SigNoz MCP server** |
 | MCP | `signoz: ✔ Connected` in Claude Code; 41 tools |
-| Overhead | **1.5 µs/event** ≈ 4.5ms CPU per minute of conversation |
-| **Real Gemini Live** | **17 turns across 3 live sessions** — all 9 adapter events verified against real `LiveServerMessage`s |
+| Overhead | **1.6 µs/event** ≈ 4.9 ms CPU per minute of conversation |
 
-### Real vs simulated, side by side
+### Real vs simulated
 
 Both live in the same dashboards, separated by `realtime.prompt.version`:
 
-| Source | Turns | Mean TTFA | p95 |
-|---|---|---|---|
-| simulated baseline (`v16`) | 1,887 | 248 ms | 442 ms |
-| simulated regression (`v17`) | 2,128 | 331 ms | 719 ms |
-| **real Gemini Live** (`real-text-driven`) | **17** | **1,120 ms** | **1,567 ms** |
+| Source | Turns | Mean TTFA | p50 | p95 | Interrupted |
+|---|---|---|---|---|---|
+| simulated baseline (`v16`) | 416 | 246 ms | 273 ms | 436 ms | 19.2% |
+| simulated regression (`v17`) | 428 | 328 ms | 390 ms | 716 ms | 31.8% |
+| **real Gemini Live** | **77** | **1,107 ms** | **1,163 ms** | **1,658 ms** | 0% |
 
 Real Gemini Live is three to four times slower than the baseline the simulator
-was tuned to. The 350ms objective is right for a *spoken* turn — it comes from
-turn-taking research — but it is not close to achievable on text-driven turns
-through this model today. That gap is the point: the instrument was built,
-pointed at reality, and reality disagreed.
+was tuned to. The 350 ms objective is right for a *spoken* turn — it comes from
+turn-taking research — but is nowhere near achievable on text-driven turns
+through this model today. Recorded as found rather than quietly retuned.
 
-`scripts/real_session.py` drives real sessions with text input and audio output,
-so it needs no microphone, and prints which normalized events the adapter
-actually produced. Before it existed, `providers/gemini.py` — the one component
-touching the vendor API — had never processed a real message.
+`scripts/real_session.py` drives real sessions with text in and audio out, so it
+needs no microphone, and reports which normalized events the adapter actually
+produced. Before it existed, `providers/gemini.py` — the one component touching
+the vendor API — had never processed a real message.
 
-### Six silent failures, and what they cost
+### Eight silent failures
 
-Realtime observability fails quietly — nothing crashes, and the application
+Realtime observability fails *quietly*: nothing crashes and the application
 reports success throughout. Each of these was found only by looking at real
-data, and each is why `scripts/doctor.py` exists:
+data, and together they are why `scripts/doctor.py` exists.
 
 1. **Collector serving `nop` pipelines.** SigNoz will not hand a collector its
    config until an organisation exists. The OTLP port accepted TCP and never
    answered; the exporter retried and dropped everything.
-2. **Exporter queue overflow.** The SDK's default 2048-span queue silently lost
+2. **Exporter queue overflow.** The SDK's default 2,048-span queue silently lost
    60% of a realtime workload — 1,201 turns delivered as 497.
 3. **Spans stamped at wall-clock.** A replayed session produced traces whose
-   attributes said 400ms while the waterfall said 0.06ms.
+   attributes said 400 ms while the waterfall said 0.06 ms.
 4. **Monotonic time used as epoch.** Every span landed near 1970.
 5. **Session span opened eagerly**, closed in the simulated past — negative
    duration, wrapped to nonsense.
 6. **Cumulative instead of delta temporality.** SigNoz scanned 36,000 rows and
    returned "No Data" on every percentile and rate query.
+7. **Durations measured on the wrong clock.** `realtime.turn.duration_ms` read
+   26,135,501 ms — seven hours — beside a span duration of 4.8 seconds. Found by
+   comparing two views of the same quantity.
+8. **Barge-in recorded against finished turns.** `_agent_active` was only
+   cleared by an event applications need not send, so every turn after the first
+   looked like an interruption: 22 barge-in events against 0% interrupted turns.
 
-Not one of these raised an exception.
+Not one raised an exception. Six of the eight were found *after* the code was
+"working".
 
 ---
 
