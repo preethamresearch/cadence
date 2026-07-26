@@ -40,22 +40,56 @@ import cadence  # noqa: E402
 from cadence import semconv  # noqa: E402
 from cadence.providers import gemini  # noqa: E402
 
-# Questions that exercise different paths: plain answers, tool calls, and a
-# deliberate repair so the dialogue classifier sees a real transcript.
-PROMPTS = [
-    "In one sentence, what is time to first audio?",
-    "How fast have you been responding? Check your telemetry.",
-    "No, that's not what I asked — how many times was I interrupted?",
-    "What is my token spend so far?",
-    "Thanks, that's all.",
+# Several conversation shapes rather than one script repeated.
+#
+# Running the same five prompts N times would produce N copies of one
+# conversation, which looks like a bigger dataset while telling you nothing
+# new. These vary length, tool pressure, and whether a repair occurs, so the
+# resulting distribution has some genuine spread.
+CONVERSATIONS = [
+    # Short, no tools — the fast path.
+    [
+        "In one sentence, what is time to first audio?",
+        "Thanks, that's all.",
+    ],
+    # Tool-heavy self-observation.
+    [
+        "How fast have you been responding? Check your telemetry.",
+        "What is my token spend so far?",
+        "How many times was I interrupted?",
+        "Summarise this session for me.",
+    ],
+    # Contains a repair, so the dialogue classifier sees a real one.
+    [
+        "How many turns have we had?",
+        "No, that's not what I asked — I meant how long they took.",
+        "Right. And is that within your latency objective?",
+    ],
+    # Longer answers, which stress streaming and stream-gap detection.
+    [
+        "Explain why barge-in offset distribution matters more than the count.",
+        "What would cause offsets to cluster under 400 milliseconds?",
+        "And what does it mean if they cluster above two seconds?",
+        "Which of those is happening right now?",
+    ],
+    # A fallback the agent genuinely cannot answer from telemetry.
+    [
+        "What is the weather in Bangalore?",
+        "Fine — what can you actually tell me about yourself?",
+        "How is your containment rate?",
+    ],
 ]
+
+
+def conversation_for(index: int) -> list[str]:
+    return CONVERSATIONS[index % len(CONVERSATIONS)]
 
 
 async def run_session(
     *,
     api_key: str,
     model: str,
-    turns: int,
+    prompts: list[str],
     capture_content: bool,
 ) -> dict:
     from google import genai
@@ -106,7 +140,7 @@ async def run_session(
         ) as session:
             print(f"session {session.recorder.session_id}  trace {session.trace_id}")
 
-            for index, prompt in enumerate(PROMPTS[:turns], start=1):
+            for index, prompt in enumerate(prompts, start=1):
                 print(f"\n  [{index}] > {prompt}")
 
                 # A text turn still opens a conversational turn: mark speech
@@ -187,7 +221,8 @@ async def main_async(args) -> int:
         print(f"\n=== session {n + 1}/{args.sessions} ===")
         try:
             results.append(await run_session(
-                api_key=api_key, model=args.model, turns=args.turns,
+                api_key=api_key, model=args.model,
+                prompts=conversation_for(n),
                 capture_content=args.capture_content,
             ))
         except Exception as exc:
@@ -239,7 +274,6 @@ def main() -> int:
     parser.add_argument("--model", default=os.getenv("GEMINI_MODEL",
                                                      "gemini-3.1-flash-live-preview"))
     parser.add_argument("--sessions", type=int, default=3)
-    parser.add_argument("--turns", type=int, default=5)
     parser.add_argument("--service", default=os.getenv("OTEL_SERVICE_NAME",
                                                        "cadence-voice-agent"))
     parser.add_argument("--endpoint", default=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT",
