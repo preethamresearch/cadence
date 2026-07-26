@@ -16,8 +16,19 @@ from typing import Any
 from opentelemetry import metrics, trace
 from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+from opentelemetry.sdk.metrics import (
+    Counter,
+    Histogram,
+    MeterProvider,
+    ObservableCounter,
+    ObservableGauge,
+    ObservableUpDownCounter,
+    UpDownCounter,
+)
+from opentelemetry.sdk.metrics.export import (
+    AggregationTemporality,
+    PeriodicExportingMetricReader,
+)
 from opentelemetry.sdk.metrics.view import ExplicitBucketHistogramAggregation, View
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
@@ -50,6 +61,21 @@ _TURN_DURATION_BUCKETS_MS = [
 ]
 
 _configured = False
+
+# SigNoz — and most OTLP backends built on ClickHouse — expect **delta**
+# temporality for counters and histograms. The OpenTelemetry Python SDK
+# defaults to cumulative, and the failure is silent and confusing: the data
+# arrives, the backend scans it, and every rate and percentile query returns
+# nothing at all. Setting this explicitly is the difference between a working
+# dashboard and one that reads "No Data" over a table full of rows.
+_DELTA_TEMPORALITY = {
+    Counter: AggregationTemporality.DELTA,
+    UpDownCounter: AggregationTemporality.CUMULATIVE,
+    Histogram: AggregationTemporality.DELTA,
+    ObservableCounter: AggregationTemporality.DELTA,
+    ObservableUpDownCounter: AggregationTemporality.CUMULATIVE,
+    ObservableGauge: AggregationTemporality.CUMULATIVE,
+}
 
 
 def _histogram_view(instrument_name: str, buckets: list[float]) -> View:
@@ -154,6 +180,7 @@ def configure(
                     OTLPMetricExporter(
                         endpoint=f"{endpoint.rstrip('/')}/v1/metrics",
                         headers=headers,
+                        preferred_temporality=_DELTA_TEMPORALITY,
                     ),
                     export_interval_millis=metric_export_interval_ms,
                 )
