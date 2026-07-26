@@ -394,3 +394,64 @@ def test_instrumentation_never_raises_into_the_agent(harness):
     rec.handle(ev(EventType.USER_SPEECH_START, 0.0))  # must not raise
     rec.handle(ev(EventType.TURN_COMPLETE, 1.0))
     rec.close()
+
+
+def test_barge_in_is_not_recorded_against_a_finished_turn(harness):
+    """Found by real Gemini sessions, not by any synthetic test.
+
+    A completed turn leaves the agent no longer holding the floor. If the
+    recorder does not clear that state, the next turn's speech-start looks
+    like an interruption, and the barge-in is attributed to a span that was
+    exported seconds ago — so the counter climbs while `interrupted` stays
+    false on every turn. Twenty-two events, zero interrupted turns.
+    """
+    exporter, _ = harness
+    rec = ConversationRecorder(session_id="s11")
+    rec.start()
+
+    # Turn 0: a clean exchange that completes on its own.
+    rec.handle(ev(EventType.USER_SPEECH_START, 0.0))
+    rec.handle(ev(EventType.USER_SPEECH_END, 1.0))
+    rec.handle(ev(EventType.AGENT_AUDIO_CHUNK, 1.3, audio_ms=200))
+    rec.handle(ev(EventType.AGENT_GENERATION_COMPLETE, 2.0))
+    rec.handle(ev(EventType.TURN_COMPLETE, 2.1, reason="completed"))
+
+    # Turn 1: the user speaks again. No PLAYBACK_FINISHED was ever sent.
+    rec.handle(ev(EventType.USER_SPEECH_START, 3.0))
+    rec.handle(ev(EventType.USER_SPEECH_END, 4.0))
+    rec.handle(ev(EventType.AGENT_AUDIO_CHUNK, 4.3, audio_ms=200))
+    rec.handle(ev(EventType.TURN_COMPLETE, 5.0, reason="completed"))
+    rec.close()
+
+    names = by_name(exporter)
+    turns = sorted(names[semconv.SPAN_TURN], key=lambda s: s.attributes[semconv.TURN_INDEX])
+    assert len(turns) == 2, "a normal second turn must not be treated as an interruption"
+    for turn in turns:
+        assert turn.attributes[semconv.TURN_END_REASON] == "completed"
+        assert turn.attributes[semconv.TURN_INTERRUPTED] is False
+
+    barge_events = sum(
+        len([e for e in s.events if e.name == semconv.EVENT_BARGE_IN])
+        for s in exporter.get_finished_spans()
+    )
+    assert barge_events == 0, "no interruption occurred, so none should be recorded"
+
+
+def test_genuine_barge_in_still_marks_the_turn(harness):
+    """The guard above must not suppress a real interruption."""
+    exporter, _ = harness
+    rec = ConversationRecorder(session_id="s12")
+    rec.start()
+
+    rec.handle(ev(EventType.USER_SPEECH_START, 0.0))
+    rec.handle(ev(EventType.USER_SPEECH_END, 1.0))
+    rec.handle(ev(EventType.AGENT_AUDIO_CHUNK, 1.2, audio_ms=200))
+    rec.handle(ev(EventType.USER_SPEECH_START, 1.9))   # cuts in mid-reply
+    rec.handle(ev(EventType.USER_SPEECH_END, 2.4))
+    rec.handle(ev(EventType.TURN_COMPLETE, 3.0))
+    rec.close()
+
+    turns = by_name(exporter)[semconv.SPAN_TURN]
+    interrupted = [t for t in turns if t.attributes[semconv.TURN_INTERRUPTED]]
+    assert len(interrupted) == 1
+    assert interrupted[0].attributes[semconv.TURN_END_REASON] == semconv.EndReason.INTERRUPTED

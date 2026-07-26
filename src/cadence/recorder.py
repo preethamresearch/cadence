@@ -168,6 +168,14 @@ class ConversationRecorder:
         # attributes say 400ms while its waterfall says 0.06ms. The event
         # timestamp is the honest one either way.
         self._clock_ns: int | None = None
+
+        # Durations are derived from the same event clock, not from
+        # time.monotonic(). Mixing the two is invisible in a live session —
+        # the clocks coincide — and catastrophic in a replayed one, where the
+        # difference is the machine's uptime. It shipped turn durations of
+        # seven hours before real sessions exposed it by comparing the span
+        # duration against the attribute.
+        self._last_monotonic: float | None = None
         self._turn: TurnState | None = None
         self._turn_index = 0
 
@@ -194,7 +202,7 @@ class ConversationRecorder:
     def start(self) -> None:
         if self._session_span is not None:
             return
-        now = time.monotonic()
+        now = self._now()
         self._session_start = now
         self._quiet_since = now
 
@@ -238,7 +246,7 @@ class ConversationRecorder:
         if self._turn is not None and not self._turn.ended:
             self._end_turn(semconv.EndReason.SESSION_CLOSED)
 
-        now = time.monotonic()
+        now = self._now()
         self._accumulate_silence(now)
 
         if outcome is None:
@@ -291,9 +299,11 @@ class ConversationRecorder:
 
     def handle(self, event: VoiceEvent) -> None:
         """Feed one normalized event through the state machine."""
-        # Advance the span clock before dispatch, so any span opened or closed
-        # by this event is stamped at the moment the event actually occurred.
+        # Advance both clocks before dispatch, so any span opened or closed by
+        # this event is stamped at the moment it occurred, and any duration
+        # derived from it is measured on the same timeline.
         self._clock_ns = event.wall_ns
+        self._last_monotonic = event.monotonic
         if self._session_span is None:
             self.start()
         try:
@@ -314,7 +324,13 @@ class ConversationRecorder:
         # The user talking over the agent is a barge-in *and* the start of the
         # next turn. Record the interruption against the utterance it cut off,
         # then hand the floor over.
-        if self._turn is not None and self._agent_active:
+        #
+        # The `not ended` guard matters: without it a barge-in can be recorded
+        # against a turn whose span has already been exported, which increments
+        # the counter and fires the event while `interrupted=True` never
+        # reaches the span. Real sessions surfaced exactly that — 22 barge-in
+        # events against 0% interrupted turns.
+        if self._turn is not None and not self._turn.ended and self._agent_active:
             self._record_barge_in(self._turn, event)
             self._end_turn(semconv.EndReason.INTERRUPTED)
 
@@ -654,8 +670,21 @@ class ConversationRecorder:
         if turn is None or turn.ended:
             return
         turn.ended = True
-        now = time.monotonic()
+        now = self._now()
         duration_ms = (now - turn.started_monotonic) * 1000.0
+
+        # On a clean completion the model has stopped producing, so the agent
+        # no longer holds the floor. Relying solely on PLAYBACK_FINISHED to
+        # clear this leaves `_agent_active` stuck True for any application that
+        # never emits it, and every subsequent turn then looks like a barge-in.
+        #
+        # Not on an interruption, though: there the turn ends the instant the
+        # user cuts in, while the agent's audio keeps playing out — and that
+        # lingering audio is precisely the overlap being measured. Clearing it
+        # here would report every interruption as zero overlap.
+        if reason != semconv.EndReason.INTERRUPTED and self._agent_active:
+            self._agent_active = False
+            self._close_overlap(now)
 
         # Close anything still open, innermost first.
         for record in list(turn.tools.values()):
@@ -838,6 +867,14 @@ class ConversationRecorder:
     # ------------------------------------------------------------------
     # Span clock
     # ------------------------------------------------------------------
+
+    def _now(self) -> float:
+        """Current time on the event clock.
+
+        Falls back to the wall clock only before the first event, where the
+        two are equivalent by definition.
+        """
+        return self._last_monotonic if self._last_monotonic is not None else time.monotonic()
 
     def _start_span(self, name: str, **kwargs: Any) -> Span:
         """Open a span stamped at the current event time.
