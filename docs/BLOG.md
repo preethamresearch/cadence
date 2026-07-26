@@ -65,18 +65,18 @@ The core problem: **carve conversational structure out of a continuous duplex
 signal.** cadence consumes the stream and emits this:
 
 ```
-voice.conversation                    one connected session
-├── voice.turn                        one exchange
-│   ├── voice.user_utterance          VAD speech-start → speech-end
+realtime.session                    one connected session
+├── realtime.turn                        one exchange
+│   ├── realtime.audio.user_utterance          VAD speech-start → speech-end
 │   ├── chat                          speech-end → generation done   [gen_ai.*]
 │   │   └── execute_tool              tools, including mid-stream
-│   └── voice.agent_utterance         first audio out → playback done
-│       └── (event) voice.barge_in    offset_ms into the reply
-└── voice.turn …
+│   └── realtime.audio.agent_utterance         first audio out → playback done
+│       └── (event) realtime.barge_in    offset_ms into the reply
+└── realtime.turn …
 ```
 
 Note that `chat` and `execute_tool` keep their standard GenAI names and
-attributes. The `voice.*` namespace **composes with** `gen_ai.*` rather than
+attributes. The `realtime.*` namespace **composes with** `gen_ai.*` rather than
 replacing it — model inference inside a turn is still just a model call, and
 existing backends should light up on it unchanged.
 
@@ -85,7 +85,7 @@ them wrong first.
 
 ### 1. Measure latency at the audio boundary, not the model boundary
 
-`voice.turn.time_to_first_audio` runs from the **last inbound frame of user
+`realtime.turn.time_to_first_audio` runs from the **last inbound frame of user
 audio** to the **first outbound frame of agent audio**.
 
 That interval deliberately includes VAD dwell time, network transit, model
@@ -106,7 +106,7 @@ def test_ttfa_measured_from_end_of_user_speech(harness):
     rec.handle(ev(EventType.AGENT_AUDIO_CHUNK, 12.42))       # replied 420ms later
 
     # 420ms, not 2420ms.
-    assert turn.attributes[VOICE_TURN_TTFA_MS] == approx(420.0)
+    assert turn.attributes[TURN_TTFA_MS] == approx(420.0)
 ```
 
 ### 2. A barge-in ends the turn and starts a new one
@@ -117,7 +117,7 @@ taking the floor, which is the definition of a new turn. Model it any other way
 and turn nesting becomes incoherent the moment a conversation gets lively.
 
 The interruption itself is recorded as a **span event on the agent utterance it
-cut off**, carrying `voice.barge_in.offset_ms`. Putting it there rather than on
+cut off**, carrying `realtime.turn.barge_in_offset_ms`. Putting it there rather than on
 a separate span means it lands at the exact point in the waterfall where the
 user cut in, which is what makes the trace readable at a glance.
 
@@ -150,7 +150,7 @@ asserts on that:
 
 ```python
 def test_agent_initiated_turn_has_no_ttfa(harness):
-    assert VOICE_TURN_TTFA_MS not in turn.attributes
+    assert TURN_TTFA_MS not in turn.attributes
 ```
 
 ## Making the silence visible
@@ -182,7 +182,7 @@ lands in one bucket and your p95 is noise. cadence registers explicit views —
 50, 100, 150, 200, 300, 400, 500, 650, 800, 1000, 1250, 1500, 2000, 3000, 5000
 ms — chosen so the interesting region is actually resolved.
 
-**Cardinality.** `voice.session.id` is deliberately *not* a metric attribute.
+**Cardinality.** `realtime.session.id` is deliberately *not* a metric attribute.
 Unique ids on metric dimensions are the classic way to melt a time-series
 backend. Session correlation belongs on spans, where it's free.
 
@@ -204,11 +204,47 @@ say which source they used** — "SigNoz hasn't picked this session up yet, but
 right now it's around 340 milliseconds." An agent that confidently reports a p95
 it does not have is worse than one that admits the data hasn't landed.
 
+
+## It works against the real API — and the numbers surprised me
+
+Everything above was built against synthetic events and a traffic simulator,
+which is fine for designing a state machine but proves nothing about the
+adapter that actually touches Gemini. So the last thing I did was run real
+sessions through it.
+
+All nine normalized events fired from real `LiveServerMessage`s — VAD
+boundaries, turn completion, tool calls, usage metadata, interruption. The
+adapter's field mappings, written from SDK introspection, held up.
+
+Then the numbers:
+
+| source | turns | mean TTFA | p95 |
+|---|---|---|---|
+| simulated baseline | 1,887 | 248 ms | 442 ms |
+| simulated regression | 2,128 | 331 ms | 719 ms |
+| **real Gemini Live** | **17** | **1,120 ms** | **1,567 ms** |
+
+Real Gemini Live is three to four times slower than the baseline I had been
+designing against. My 350ms objective — which I picked from turn-taking
+research, and still believe is the right target for a *spoken* turn — is not
+close to achievable on text-driven turns through this model today.
+
+That is exactly the kind of thing you only learn by measuring, and it is a
+better argument for the project than any dashboard: I built the instrument,
+pointed it at reality, and reality disagreed with my assumptions.
+
+One more finding, from the same run. Barge-in fired twelve times across
+fifteen turns — far more than a scripted run should produce. The cause is real:
+sending the next prompt promptly after `turn_complete` arrives makes Gemini
+report an interruption, because audio from the previous turn is still
+streaming. Good evidence that barge-in detection works. Also a reminder that a
+metric can be correct and still need context before you act on it.
+
 ## What I'd do differently
 
-The `voice.*` conventions are a **proposal**, not a standard, and there are
-genuinely open questions. Should `voice.turn` be its own span name, or
-`invoke_agent` with a `voice.*` attribute set? The latter reuses more existing
+The `realtime.*` conventions are a **proposal**, not a standard, and there are
+genuinely open questions. Should `realtime.turn` be its own span name, or
+`invoke_agent` with a `realtime.*` attribute set? The latter reuses more existing
 tooling; I chose the former for clarity, and I'm not certain that was right.
 Multi-party audio is entirely out of scope. And I'm unsure whether TTFA is the
 right primary metric or whether the standard should also define

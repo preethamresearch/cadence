@@ -136,6 +136,28 @@ documented in the commit history:
 | Alerts | 3 rules live, provisioned **through the SigNoz MCP server** |
 | MCP | `signoz: ✔ Connected` in Claude Code; 41 tools |
 | Overhead | **1.5 µs/event** ≈ 4.5ms CPU per minute of conversation |
+| **Real Gemini Live** | **17 turns across 3 live sessions** — all 9 adapter events verified against real `LiveServerMessage`s |
+
+### Real vs simulated, side by side
+
+Both live in the same dashboards, separated by `realtime.prompt.version`:
+
+| Source | Turns | Mean TTFA | p95 |
+|---|---|---|---|
+| simulated baseline (`v16`) | 1,887 | 248 ms | 442 ms |
+| simulated regression (`v17`) | 2,128 | 331 ms | 719 ms |
+| **real Gemini Live** (`real-text-driven`) | **17** | **1,120 ms** | **1,567 ms** |
+
+Real Gemini Live is three to four times slower than the baseline the simulator
+was tuned to. The 350ms objective is right for a *spoken* turn — it comes from
+turn-taking research — but it is not close to achievable on text-driven turns
+through this model today. That gap is the point: the instrument was built,
+pointed at reality, and reality disagreed.
+
+`scripts/real_session.py` drives real sessions with text input and audio output,
+so it needs no microphone, and prints which normalized events the adapter
+actually produced. Before it existed, `providers/gemini.py` — the one component
+touching the vendor API — had never processed a real message.
 
 ### Six silent failures, and what they cost
 
