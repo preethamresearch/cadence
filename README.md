@@ -11,7 +11,7 @@ SLO for agents that talk, see, and act over a live stream — shipped to
 *Built for the [Agents of SigNoz](https://www.wemakedevs.org/hackathons/signoz)
 hackathon · Track 1: AI & Agent Observability*
 
-**[▶ Live demo](https://preethamresearch.github.io/cadence/)** · no signup, no API key
+**[▶ Watch the demo](https://youtu.be/CZ2TeXH-yFY)** · **[Live demo](https://preethamresearch.github.io/cadence/)** — no signup, no API key
 
 </div>
 

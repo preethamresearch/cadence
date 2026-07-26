@@ -14,9 +14,9 @@ Answers for <https://forms.gle/xv1TXSiC54MEWujRA>. Fill the bracketed bits.
 
 **GitHub link:** https://github.com/preethamresearch/cadence
 
-**Deployed link:** `[Cloud Run URL]`
+**Deployed link:** https://preethamresearch.github.io/cadence/
 
-**YouTube demo:** `[…]`
+**YouTube demo:** https://youtu.be/CZ2TeXH-yFY
 
 **Blog:** `[Dev.to URL]`
 
