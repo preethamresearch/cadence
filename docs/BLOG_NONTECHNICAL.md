@@ -54,7 +54,7 @@ the gap *between* the things they measure.
 
 So I drew it.
 
-![The silence between speakers, drawn as an amber gap](./blog_assets/05-console-silence.jpg)
+![The silence between speakers, drawn as an amber gap](https://raw.githubusercontent.com/preethamresearch/cadence/main/blog_assets/05-console-silence.jpg)
 
 Blue is the person talking. Violet is the agent. The amber band in the middle
 is the silence, with the milliseconds counting up while it lasts.
@@ -104,7 +104,7 @@ down six, with a reason for each rather than a round number that felt nice:
 | Turns where the user repeated themselves | under 9% | The closest thing to "did it work" |
 | Escalations to a human | under 11% | The commercial ceiling |
 
-![The six objectives, with targets drawn on each panel](./blog_assets/02-slo-dashboard.jpg)
+![The six objectives, with targets drawn on each panel](https://raw.githubusercontent.com/preethamresearch/cadence/main/blog_assets/02-slo-dashboard.jpg)
 
 The fifth one is my favourite, and it took the longest to arrive at. **How
 often did the person have to say it again?** Not the latency, not the token
@@ -126,7 +126,7 @@ Then I pointed the whole thing at a real Gemini Live agent.
 **1,107 milliseconds.** Three to four times slower than the world I had spent a
 day designing for.
 
-![Real sessions plotted against the simulated baseline](./blog_assets/03-diagnostics-v16-v17.jpg)
+![Real sessions plotted against the simulated baseline](https://raw.githubusercontent.com/preethamresearch/cadence/main/blog_assets/03-diagnostics-v16-v17.jpg)
 
 The orange line is reality. The two flat lines below it are what I had assumed.
 

@@ -39,7 +39,7 @@ realtime.session                        one connected session
 │       └── (event) realtime.barge_in   offset_ms into the reply
 ```
 
-![Real Gemini Live session as an OpenTelemetry trace in SigNoz](./blog_assets/01-trace-waterfall.jpg)
+![Real Gemini Live session as an OpenTelemetry trace in SigNoz](https://raw.githubusercontent.com/preethamresearch/cadence/main/blog_assets/01-trace-waterfall.jpg)
 
 That is a real Gemini session in SigNoz. Getting there took the eight bugs
 below.
@@ -201,7 +201,7 @@ OTLPMetricExporter(
 
 One dictionary. Every panel populated.
 
-![Conversation SLO dashboard with target lines drawn](./blog_assets/02-slo-dashboard.jpg)
+![Conversation SLO dashboard with target lines drawn](https://raw.githubusercontent.com/preethamresearch/cadence/main/blog_assets/02-slo-dashboard.jpg)
 
 Worth checking with the MCP server, which auto-fetches the metric's metadata
 and tells you what it thinks it is holding:
@@ -240,7 +240,7 @@ exactly the overlap being measured.
 | simulated `v17` | 428 | 328 ms | 716 ms |
 | **real Gemini Live** | **77** | **1,107 ms** | **1,658 ms** |
 
-![TTFA split by prompt version, with the real series well above both](./blog_assets/03-diagnostics-v16-v17.jpg)
+![TTFA split by prompt version, with the real series well above both](https://raw.githubusercontent.com/preethamresearch/cadence/main/blog_assets/03-diagnostics-v16-v17.jpg)
 
 Real Gemini Live is three to four times slower than the baseline I had spent a
 day designing against. My 350 ms objective comes from turn-taking research and
