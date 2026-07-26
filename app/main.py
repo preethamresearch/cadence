@@ -60,7 +60,14 @@ _signoz_config = SigNozConfig.from_env()
 
 
 @app.get("/")
-async def index() -> FileResponse:
+async def landing() -> FileResponse:
+    """Explain the project before showing the instrument. A judge landing on a
+    bare console has no idea what they are looking at."""
+    return FileResponse(STATIC_DIR / "landing.html")
+
+
+@app.get("/console")
+async def console() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
 
 
