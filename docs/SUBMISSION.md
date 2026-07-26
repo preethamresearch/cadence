@@ -18,7 +18,7 @@ Answers for <https://forms.gle/xv1TXSiC54MEWujRA>. Fill the bracketed bits.
 
 **YouTube demo:** https://youtu.be/CZ2TeXH-yFY
 
-**Blog:** `[Dev.to URL]`
+**Blog:** https://dev.to/preetham_25a78ec384dac787/signoz-scanned-36000-rows-and-told-me-no-data-1o39
 
 ---
 
