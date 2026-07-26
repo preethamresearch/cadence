@@ -236,6 +236,22 @@ def user_audio_event(num_bytes: int, sample_rate: int = INPUT_SAMPLE_RATE) -> Vo
     )
 
 
+def user_turn_start_event(source: str = "client_text") -> VoiceEvent:
+    """Open a turn for input the provider's VAD will never announce.
+
+    Text-driven turns produce no ``ACTIVITY_START``, so without this the
+    recorder has nothing to open a turn from and the whole exchange lands as
+    an agent-initiated turn with no time-to-first-response. Applications
+    mixing text and speech input need to mark the boundary themselves.
+    """
+    return _event(EventType.USER_SPEECH_START, source=source)
+
+
+def user_turn_end_event(source: str = "client_text") -> VoiceEvent:
+    """Close user input and start the time-to-first-response clock."""
+    return _event(EventType.USER_SPEECH_END, source=source)
+
+
 def video_frame_event() -> VoiceEvent:
     return _event(EventType.VIDEO_FRAME_SENT)
 
