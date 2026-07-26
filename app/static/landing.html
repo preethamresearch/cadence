@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Cadence — observability for real-time voice agents</title>
-  <meta name="description" content="OpenTelemetry instrumentation for real-time, full-duplex voice agents. Turn boundaries, time-to-first-audio, and barge-in — traced to SigNoz." />
+  <meta name="description" content="Telemetry for real-time multimodal agents. Turn boundaries, time-to-first-audio, barge-in, and a Conversation SLO — traced to SigNoz over OpenTelemetry." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
@@ -120,21 +120,21 @@
     <span class="kicker">the model</span>
     <h2>Conversational structure, carved out of a signal stream</h2>
     <p>
-      <code>voice.*</code> composes with <code>gen_ai.*</code> rather than
+      <code>realtime.*</code> composes with <code>gen_ai.*</code> rather than
       replacing it. Model inference inside a turn is still a standard
       <code>chat</code> span, so existing backends light up unchanged.
     </p>
   </div>
 
   <div class="model-grid">
-    <pre class="tree"><span class="t-root">voice.conversation</span>                <span class="t-c">one connected session</span>
-├── <span class="t-turn">voice.turn</span>                    <span class="t-c">one exchange</span>
-│   ├── <span class="t-user">voice.user_utterance</span>      <span class="t-c">VAD start → end</span>
+    <pre class="tree"><span class="t-root">realtime.session</span>                  <span class="t-c">one connected session</span>
+├── <span class="t-turn">realtime.turn</span>                    <span class="t-c">one exchange</span>
+│   ├── <span class="t-user">realtime.audio.user_utterance</span>      <span class="t-c">VAD start → end</span>
 │   ├── <span class="t-chat">chat</span>                      <span class="t-c">[gen_ai.*]</span>
 │   │   └── <span class="t-chat">execute_tool</span>          <span class="t-c">incl. mid-stream</span>
-│   └── <span class="t-agent">voice.agent_utterance</span>     <span class="t-c">first audio → done</span>
-│       └── <span class="t-barge">(event) voice.barge_in</span>  <span class="t-c">offset_ms</span>
-└── <span class="t-turn">voice.turn</span> …</pre>
+│   └── <span class="t-agent">realtime.audio.agent_utterance</span>     <span class="t-c">first audio → done</span>
+│       └── <span class="t-barge">(event) realtime.barge_in</span>  <span class="t-c">offset_ms</span>
+└── <span class="t-turn">realtime.turn</span> …</pre>
 
     <div class="decisions">
       <div class="decision">
@@ -193,7 +193,7 @@
   </div>
   <p class="split-note">
     A barge-in <b>counter</b> cannot tell these apart. The offset
-    <b>histogram</b> can — which is why <code>voice.barge_in.offset</code> is a
+    <b>histogram</b> can — which is why <code>realtime.barge_in.offset</code> is a
     histogram, not a count.
   </p>
 </section>
@@ -221,15 +221,15 @@
 
   <div class="metric-table">
     <div class="mt-head"><span>instrument</span><span>type</span><span>what it tells you</span></div>
-    <div class="mt-row"><code>voice.turn.time_to_first_audio</code><span class="mt-t hist">histogram</span><span>The silence the user sat through. Buckets 50ms–5s, not OTel's HTTP-shaped defaults.</span></div>
-    <div class="mt-row"><code>voice.barge_in.offset</code><span class="mt-t hist">histogram</span><span>How far into a reply interruptions land. The distribution is the diagnostic.</span></div>
-    <div class="mt-row"><code>voice.turn.count</code><span class="mt-t ctr">counter</span><span>Split by end reason — completed, interrupted, abandoned.</span></div>
-    <div class="mt-row"><code>voice.audio.input.seconds</code><span class="mt-t ctr">counter</span><span>The meter that runs while nobody is talking.</span></div>
+    <div class="mt-row"><code>realtime.turn.time_to_first_audio</code><span class="mt-t hist">histogram</span><span>The silence the user sat through. Buckets 50ms–5s, not OTel's HTTP-shaped defaults.</span></div>
+    <div class="mt-row"><code>realtime.barge_in.offset</code><span class="mt-t hist">histogram</span><span>How far into a reply interruptions land. The distribution is the diagnostic.</span></div>
+    <div class="mt-row"><code>realtime.turn.count</code><span class="mt-t ctr">counter</span><span>Split by end reason — completed, interrupted, abandoned.</span></div>
+    <div class="mt-row"><code>realtime.audio.input.seconds</code><span class="mt-t ctr">counter</span><span>The meter that runs while nobody is talking.</span></div>
     <div class="mt-row"><code>gen_ai.client.token.usage</code><span class="mt-t ctr">counter</span><span>Standard GenAI instrument, plus a modality dimension. Audio dominates.</span></div>
   </div>
 
   <p class="note">
-    <b>Cardinality:</b> <code>voice.session.id</code> is deliberately <em>not</em>
+    <b>Cardinality:</b> <code>realtime.session.id</code> is deliberately <em>not</em>
     a metric attribute. Unique ids on metric dimensions are the standard way to
     melt a time-series backend. Session correlation belongs on spans, where it's free.
   </p>
