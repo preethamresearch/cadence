@@ -287,7 +287,7 @@ them would have surfaced any other way.
 
 *Code, the `realtime.*` semantic conventions, and importable SigNoz dashboards:
 [github.com/preethamresearch/cadence](https://github.com/preethamresearch/cadence)
-· [3-minute demo](https://youtu.be/CZ2TeXH-yFY)*
+· [demo](https://youtu.be/fIbf-5_2tRQ) · [full walkthrough](https://youtu.be/CZ2TeXH-yFY)*
 
 *Built for the Agents of SigNoz hackathon. Written by me; I used an AI
 assistant for the code and for editing this post, which is declared in the

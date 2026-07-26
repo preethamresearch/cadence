@@ -293,7 +293,7 @@ hasn't landed.
 ## Tests
 
 ```bash
-.venv/bin/pytest -q            # 33 tests
+.venv/bin/pytest -q            # 35 tests
 .venv/bin/pytest tests/test_overhead.py -s   # prints the overhead number
 ```
 

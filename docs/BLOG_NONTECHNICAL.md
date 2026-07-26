@@ -170,9 +170,9 @@ measuring it.
 
 ---
 
-*The tooling is open source, along with a three-minute demo:
+*The tooling is open source, along with a short demo:
 [github.com/preethamresearch/cadence](https://github.com/preethamresearch/cadence)
-· [watch it](https://youtu.be/CZ2TeXH-yFY)*
+· [watch it](https://youtu.be/fIbf-5_2tRQ)*
 
 *Built for the Agents of SigNoz hackathon. Written by me; I used an AI
 assistant for the code and for editing this post, which is declared in the
