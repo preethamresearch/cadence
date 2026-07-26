@@ -11,6 +11,8 @@ SLO for agents that talk, see, and act over a live stream — shipped to
 *Built for the [Agents of SigNoz](https://www.wemakedevs.org/hackathons/signoz)
 hackathon · Track 1: AI & Agent Observability*
 
+**[▶ Live demo](https://preethamresearch.github.io/cadence/)** · no signup, no API key
+
 </div>
 
 ---
@@ -116,6 +118,45 @@ An alert saying *"TTFA crossed 350ms"* tells you what the chart already showed.
 It stays quiet when nothing explains the change — if every segment moved
 together, it says *"look upstream"* rather than inventing a culprit. A
 confident wrong attribution is worse than none, because people act on it.
+
+---
+
+## Verified against a live SigNoz
+
+Not a claim — this was run end to end, and every failure along the way is
+documented in the commit history:
+
+| Signal | Verified |
+|---|---|
+| Spans ingested | **16,596** across ~1,600 simulated conversations |
+| Metric series | **45** distinct `realtime.*` series |
+| Trace shape | `realtime.session` → `realtime.turn` → utterances → `chat` → `execute_tool`, 46 spans in a 1.35-minute session |
+| TTFA p95 | **487ms** on prompt v16, **720ms** on v17 — against a 350ms objective |
+| Dashboards | 2, provisioned over the API, populated, targets drawn |
+| Alerts | 3 rules live, provisioned **through the SigNoz MCP server** |
+| MCP | `signoz: ✔ Connected` in Claude Code; 41 tools |
+| Overhead | **1.5 µs/event** ≈ 4.5ms CPU per minute of conversation |
+
+### Six silent failures, and what they cost
+
+Realtime observability fails quietly — nothing crashes, and the application
+reports success throughout. Each of these was found only by looking at real
+data, and each is why `scripts/doctor.py` exists:
+
+1. **Collector serving `nop` pipelines.** SigNoz will not hand a collector its
+   config until an organisation exists. The OTLP port accepted TCP and never
+   answered; the exporter retried and dropped everything.
+2. **Exporter queue overflow.** The SDK's default 2048-span queue silently lost
+   60% of a realtime workload — 1,201 turns delivered as 497.
+3. **Spans stamped at wall-clock.** A replayed session produced traces whose
+   attributes said 400ms while the waterfall said 0.06ms.
+4. **Monotonic time used as epoch.** Every span landed near 1970.
+5. **Session span opened eagerly**, closed in the simulated past — negative
+   duration, wrapped to nonsense.
+6. **Cumulative instead of delta temporality.** SigNoz scanned 36,000 rows and
+   returned "No Data" on every percentile and rate query.
+
+Not one of these raised an exception.
 
 ---
 
