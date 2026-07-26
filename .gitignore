@@ -8,3 +8,5 @@ dist/
 .pytest_cache/
 .DS_Store
 node_modules/
+demo_build/
+site/
